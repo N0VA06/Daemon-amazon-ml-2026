@@ -15,6 +15,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from src.logging_utils import LOG
+
 _MODEL_CACHE: dict[str, object] = {}
 
 
@@ -45,7 +47,10 @@ def load_sentence_transformer(
     repo = adapter_path or cfg.backbone.repo
     key = str(repo)
     if use_cache and key in _MODEL_CACHE:
+        LOG.info("model cache hit  %s", key)
         return _MODEL_CACHE[key]
+    LOG.info("loading SentenceTransformer  %s  dtype=%s  max_len=%s  cache=%s",
+             key, getattr(cfg.backbone, "dtype", "bfloat16"), cfg.backbone.max_seq_length, use_cache)
 
     import torch
 
@@ -137,12 +142,14 @@ def encode_frame_views(
         np.save(id_p, df["entity_id"].astype(str).to_numpy())
     need = [v for v in views if overwrite or not embedding_path(cache, split, source, v, tag).exists()]
     if not need:
+        LOG.info("embedding cache hit  %s/%s tag=%s", split, source, tag)
         return {v: embedding_path(cache, split, source, v, tag) for v in views}
     if model is None:
         model = load_sentence_transformer(cfg)
     batch = int(cfg.hardware.encode_batch_size)
     col = {"combined": "text_combined", "name": "text_name", "address": "text_address"}
     for view in need:
+        LOG.info("encode  %s/%s/%s/%s  n=%s  batch=%s", split, source, view, tag, f"{len(df):,}", batch)
         texts = df[col[view]].astype(str).tolist()
         embs = encode_texts(model, texts, batch_size=batch, normalize=cfg.backbone.normalize)
         p = embedding_path(cache, split, source, view, tag)

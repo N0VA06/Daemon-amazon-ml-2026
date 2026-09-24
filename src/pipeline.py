@@ -7,8 +7,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.embeddings import encode_frame_views, load_embeddings, load_id_index, load_sentence_transformer
+from src.embeddings import encode_frame_views, load_embeddings, load_id_index
 from src.io_utils import load_ground_truth, load_sources
+from src.logging_utils import LOG
 from src.normalize import (
     attach_record_texts,
     compute_idf,
@@ -40,15 +41,23 @@ def maybe_subsample_s1(s1: pd.DataFrame, cfg) -> pd.DataFrame:
 
 
 def load_train(cfg):
+    LOG.info("reading train TSVs from %s (sep=tab, dtype=str)", cfg.paths.train_dir)
     s1, s2, s3 = load_sources(cfg.paths.train_dir, "train")
     gt = load_ground_truth(Path(cfg.paths.train_dir) / "train_ground_truth.tsv")
+    LOG.info("train rows  S1=%s  S2=%s  S3=%s  GT=%s", f"{len(s1):,}", f"{len(s2):,}", f"{len(s3):,}", f"{len(gt):,}")
     s1 = maybe_subsample_s1(s1, cfg)
+    if getattr(cfg.debug, "max_s1", None):
+        LOG.info("debug.max_s1=%s → S1 now %s", cfg.debug.max_s1, f"{len(s1):,}")
     gt = gt[gt["source1_entity_id"].isin(set(s1["entity_id"]))].copy()
     return s1, s2, s3, gt
 
 
 def load_test(cfg):
+    LOG.info("reading test TSVs from %s", cfg.paths.test_dir)
     t1, t2, t3 = load_sources(cfg.paths.test_dir, "test")
+    LOG.info("test rows   S1=%s  S2=%s  S3=%s", f"{len(t1):,}", f"{len(t2):,}", f"{len(t3):,}")
+    n_fr = int((t1["country"].astype(str).str.lower() == "france").sum())
+    LOG.info("test S1 with country=France: %s (every test S1 must appear in the output)", f"{n_fr:,}")
     t1 = maybe_subsample_s1(t1, cfg)
     return t1, t2, t3
 
@@ -60,11 +69,14 @@ def norm_path(cfg, split: str, source: str) -> Path:
 def load_or_build_normalized(cfg, df: pd.DataFrame, split: str, source: str, extra_abbrev=None):
     path = norm_path(cfg, split, source)
     if path.exists():
+        LOG.info("cache hit  %s  (%s rows)", path, f"{len(df):,}")
         return pd.read_parquet(path)
+    LOG.info("normalizing %s/%s  n=%s  → %s", split, source, f"{len(df):,}", path)
     out = normalize_frame(df, extra_abbrev)
     out = attach_record_texts(out, cfg.backbone.prefix, cfg.backbone.record_template)
     path.parent.mkdir(parents=True, exist_ok=True)
     out.to_parquet(path, index=False)
+    LOG.info("wrote %s", path)
     return out
 
 
@@ -88,6 +100,7 @@ def build_all_normalized(cfg) -> dict:
             right_a.append(s_all.loc[mid].business_address)
         extra.update(mine_abbreviations(left_n, right_n, int(cfg.normalize.min_abbrev_count)))
         extra.update(mine_abbreviations(left_a, right_a, int(cfg.normalize.min_abbrev_count)))
+        LOG.info("mined %s abbreviation substitutions from matched train pairs", len(extra))
         (cache_dir(cfg) / "mined_abbrev.json").write_text(
             __import__("json").dumps(extra, indent=2), encoding="utf-8"
         )
@@ -109,6 +122,7 @@ def build_all_normalized(cfg) -> dict:
                 token_lists.extend(df["addr_tokens"].astype(str).map(str.split).tolist())
             idf = compute_idf(token_lists)
             save_idf(idf, idf_path)
+            LOG.info("IDF vocab size %s → %s", f"{len(idf):,}", idf_path)
     return frames
 
 
@@ -122,7 +136,10 @@ def load_idf_if_any(cfg) -> dict | None:
 def build_splits(cfg, s1: pd.DataFrame, gt: pd.DataFrame) -> dict:
     path = cache_dir(cfg) / "splits.json"
     if path.exists():
+        LOG.info("cache hit  splits %s", path)
         return load_split(path)
+    LOG.info("building hold-out (val_frac=%s) and %s OOF folds on %s S1 entities",
+             cfg.split.val_frac, cfg.split.n_folds, f"{len(s1):,}")
     tr, va = make_holdout(s1, gt, float(cfg.split.val_frac), int(cfg.seed))
     folds = make_oof_folds(s1, gt, int(cfg.split.n_folds), int(cfg.seed))
     ids = s1["entity_id"].astype(str).to_numpy()

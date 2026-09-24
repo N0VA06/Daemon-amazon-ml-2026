@@ -67,15 +67,15 @@ blocking:
   tfidf_svd_dim: 256           # sparse TF-IDF → SVD → FAISS
   rare_token_idf_quantile: 0.70
   faiss_index: ivf             # flat | ivf | hnsw
-  faiss_nlist: 4096
-  faiss_nprobe: 32
+  faiss_nlist: 8192            # ~4*sqrt(N) for a 5–10M gallery; 124 GB RAM is enough
+  faiss_nprobe: 48
   faiss_use_zero_shot: true    # Stage 3 baseline
   faiss_use_finetuned: true    # Stage 4+
 
 features:
   compute_zero_shot_cosine: true
   compute_finetuned_cosine: true
-  chunk_pairs: 100000
+  chunk_pairs: 250000          # 124 GB RAM; smaller is only needed on tight machines
 
 matcher:
   objective: binary
@@ -115,27 +115,24 @@ biencoder:
     - down_proj
   temperature: 0.05            # τ; scale = 1/τ = 20
   scale: 20
-  effective_batch_size: 512
-  mini_batch_size: 32
+  effective_batch_size: 1024   # auto_batch sets 1024 on L4-class (20–24 GB)
+  mini_batch_size: 64          # auto_batch overwrites from VRAM
   lr: 1.0e-4                   # 2e-5 if full_finetune
   full_finetune_lr: 2.0e-5
   warmup_ratio: 0.10
   phase_a_epochs: 2
   phase_b_epochs: 1
   hard_negatives_per_anchor: 2
-  max_train_pairs: 400000
+  max_train_pairs: 800000      # L4 + 124 GB; drop to 400000 for a faster first pass
   max_hard_neg_pool: 80
   use_matryoshka: true
   use_entity_aware_sampler: true
-  use_gist_fallback: true
-  gist_guide_frozen: true
   no_duplicates: true
   gradient_checkpointing: true
   phase_b_aux_loss: cosent     # cosent | online_contrastive
   online_contrastive_margin: 0.5
   cosent_lambda: 20.0
   eval_ks: [1, 10, 50]
-  train_per_fold: true         # OOF: no feature from a model that saw that pair
 
 cross_encoder:
   enabled: true
@@ -166,9 +163,9 @@ decision:
   compare_all_rules: true      # Stage 6 ablation on OOF / hold-out
 
 hardware:
-  auto_batch: true
-  encode_batch_size: 64        # overwritten by GPU detect when auto_batch
-  faiss_gpu: false
+  auto_batch: true             # L4 24 GB → encode 256, mini 64, InfoNCE 1024, CE 16
+  encode_batch_size: 256       # overwritten by GPU detect when auto_batch
+  faiss_gpu: false             # CPU FAISS; 124 GB RAM holds 10M×1024-d indexes
 
 debug:
   max_s1: null                 # set an int to subsample S1 for a dry run

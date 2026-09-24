@@ -106,15 +106,12 @@ biencoder:
   max_hard_neg_pool: 80
   use_matryoshka: true
   use_entity_aware_sampler: true
-  use_gist_fallback: true
-  gist_guide_frozen: true
   no_duplicates: true
   gradient_checkpointing: true
   phase_b_aux_loss: cosent
   online_contrastive_margin: 0.5
   cosent_lambda: 20.0
   eval_ks: [1, 10, 50]
-  train_per_fold: true
 
 cross_encoder:
   enabled: true

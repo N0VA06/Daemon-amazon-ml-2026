@@ -20,7 +20,7 @@ from tqdm import tqdm
 from src.augment import augment_record, make_hard_negative
 from src.embeddings import encode_texts, get_auto_model, load_sentence_transformer
 from src.evaluate import recall_at_k_curve
-from src.logging_utils import write_json
+from src.logging_utils import LOG, write_json
 from src.normalize import build_record_text
 from src.sampler import EntityAwareBatchSampler
 
@@ -329,6 +329,7 @@ def train_biencoder(
         s1, gallery, gt, cfg.backbone.prefix, cfg.backbone.record_template,
         int(cfg.biencoder.max_train_pairs), int(cfg.seed),
     )
+    LOG.info("biencoder  device=%s  positive pairs=%s  gallery=%s", device, f"{len(pairs):,}", f"{len(gallery):,}")
     hard = mine_hard_negatives(
         pairs, s1, gallery, zs_s1, zs_gal, truth_map,
         k=int(cfg.biencoder.max_hard_neg_pool),

@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.io_utils import load_ground_truth, load_sources
-from src.logging_utils import write_json
+from src.logging_utils import LOG, write_json
 
 
 def _counts_by(df: pd.DataFrame, col: str) -> dict:
@@ -30,6 +30,7 @@ def _source_summary(name: str, df: pd.DataFrame) -> dict:
 def run_eda(cfg) -> dict:
     reports = Path(cfg.paths.reports_dir)
     reports.mkdir(parents=True, exist_ok=True)
+    LOG.info("EDA  reading train + test TSVs")
 
     s1, s2, s3 = load_sources(cfg.paths.train_dir, "train")
     t1, t2, t3 = load_sources(cfg.paths.test_dir, "test")

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import subprocess
 import sys
 from pathlib import Path
@@ -32,7 +31,7 @@ from src.io_utils import (
     write_candidate_pairs,
     write_matching_results,
 )
-from src.logging_utils import log_experiment, write_json
+from src.logging_utils import LOG, banner, log_experiment, setup_logging, write_json
 from src.matcher import load_matcher, oof_train_matcher, predict_lgbm, save_matcher
 from src.pipeline import (
     build_all_normalized,
@@ -69,6 +68,7 @@ STAGES = (
 
 
 def _log(cfg, stage: str, message: str, metrics=None):
+    LOG.info("%s", message)
     log_experiment(cfg.paths.experiments_log, stage, message, metrics)
 
 
@@ -77,13 +77,24 @@ def _truth(gt) -> dict:
 
 
 def stage_eda(cfg):
+    banner("eda")
     _self_test()
+    LOG.info("F0.5 self-test passed  (pred {A,B,C} vs truth {A,C} → 0.714)")
     metrics = run_eda(cfg)
-    _log(cfg, "eda", "Stage 0 EDA written to reports/eda.md.", metrics)
+    LOG.info(
+        "EDA  train_S1=%s  singleton_rate=%s  one_to_one=%s  same_country=%s  France_test_S1=%s",
+        metrics.get("n_s1_train"),
+        f"{metrics.get('singleton_rate', 0):.4f}" if metrics.get("singleton_rate") is not None else "?",
+        metrics.get("one_to_one"),
+        metrics.get("always_same_country"),
+        metrics.get("n_france_test_s1"),
+    )
+    _log(cfg, "eda", "EDA written to reports/eda.md.", metrics)
     return metrics
 
 
 def stage_split(cfg):
+    banner("split")
     s1, s2, s3, gt = load_train(cfg)
     payload = build_splits(cfg, s1, gt)
     # materialise val gallery ids
@@ -105,11 +116,14 @@ def stage_split(cfg):
         "loco_countries": list(payload["loco"].keys()),
     }
     write_json(Path(cfg.paths.reports_dir) / "split.json", metrics)
-    _log(cfg, "split", "S1-entity hold-out + 3 OOF folds + LOCO masks.", metrics)
+    LOG.info("hold-out train_S1=%s  val_S1=%s  val_gallery=%s",
+             f"{metrics['n_train_s1']:,}", f"{metrics['n_val_s1']:,}", f"{metrics['n_val_gallery']:,}")
+    _log(cfg, "split", "S1-entity hold-out + OOF folds.", metrics)
     return metrics
 
 
 def stage_normalize(cfg):
+    banner("normalize")
     frames = build_all_normalized(cfg)
     metrics = {k: int(len(v)) for k, v in frames.items()}
     metrics["idf"] = bool((cache_dir(cfg) / "idf.json").exists())
@@ -144,7 +158,8 @@ def _ensure_embeddings(cfg, df, split, source, tag, model=None):
 
 
 def stage_block(cfg, tag: str | None = None):
-    """Blocking on the hold-out validation split (and later on test via predict)."""
+    """Blocking on the hold-out validation split (test blocking is in predict)."""
+    banner("block")
     train_s1, val_s1, val_gal, gt, splits, *_ = _holdout_frames(cfg)
     tmap = _truth(gt)
 
@@ -177,7 +192,7 @@ def stage_block(cfg, tag: str | None = None):
         keep = [i for i, eid in enumerate(gal_ids) if eid in gal_map.index]
         gal_emb = gal_emb[keep]
     except Exception as exc:
-        print(f"[block] embedding path failed ({exc}); TF-IDF + keys only")
+        LOG.warning("embedding path failed (%s); TF-IDF + keys only", exc)
         s1_emb = gal_emb = None
         val_gal_aligned = val_gal
 
@@ -194,6 +209,7 @@ def stage_block(cfg, tag: str | None = None):
 
 
 def stage_train_biencoder(cfg):
+    banner("train_biencoder")
     from src.biencoder import train_biencoder
 
     train_s1, val_s1, val_gal, gt, splits, s1n, s2n, s3n = _holdout_frames(cfg)
@@ -217,7 +233,7 @@ def stage_train_biencoder(cfg):
         zs_gal, _ = concat_gallery_emb(cfg, "trainhold", "combined", "zs")
         train_gal = pd.concat([g2t, g3t], ignore_index=True)
     except Exception as exc:
-        print(f"[biencoder] zero-shot mine skipped: {exc}")
+        LOG.warning("zero-shot hard-neg mine skipped: %s", exc)
         train_gal = gallery_of(s2n, s3n)
 
     out = Path(cfg.paths.models_dir) / "biencoder"
@@ -247,11 +263,12 @@ def _add_cosines(cfg, pairs, s1, gallery, split_s1, split_gal, tag, prefix):
         s1_index = load_id_index(Path(cfg.paths.cache_dir), split_s1, "s1")
         return add_embedding_features(pairs, s1_index, gal_index, s1_emb, gal_emb, prefix)
     except Exception as exc:
-        print(f"[features] cosine {prefix}/{tag} skipped: {exc}")
+        LOG.warning("cosine %s/%s skipped: %s", prefix, tag, exc)
         return pairs
 
 
 def stage_features(cfg):
+    banner("features")
     train_s1, val_s1, val_gal, gt, splits, *_ = _holdout_frames(cfg)
     tmap = _truth(gt)
     pair_path = cache_dir(cfg) / "val_pairs_zs.parquet"
@@ -281,6 +298,7 @@ def stage_features(cfg):
 
 
 def stage_train_matcher(cfg):
+    banner("train_matcher")
     feats = load_parquet(cache_dir(cfg) / "val_features.parquet")
     # 3 folds over S1 on the hold-out itself for OOF p_gbm
     s1_ids = feats["s1_id"].drop_duplicates().tolist()
@@ -300,12 +318,15 @@ def stage_train_matcher(cfg):
         "mean_p_gbm_neg": float(out.loc[out["label"] == 0, "p_gbm"].mean()),
         "n_features": len(cols),
     }
+    LOG.info("LightGBM  pos_mean_p=%.4f  neg_mean_p=%.4f  n_features=%s",
+             metrics["mean_p_gbm_pos"], metrics["mean_p_gbm_neg"], metrics["n_features"])
     write_json(Path(cfg.paths.reports_dir) / "matcher.json", metrics)
     _log(cfg, "train_matcher", "LightGBM OOF + final model.", metrics)
     return metrics
 
 
 def stage_train_crossencoder(cfg):
+    banner("train_crossencoder")
     from src.crossencoder import apply_ce_topn, train_crossencoder
 
     feats = load_parquet(cache_dir(cfg) / "val_features.parquet")
@@ -320,6 +341,7 @@ def stage_train_crossencoder(cfg):
 
 
 def stage_stack(cfg):
+    banner("stack")
     feats = load_parquet(cache_dir(cfg) / "val_features.parquet")
     if "p_gbm" not in feats.columns:
         raise RuntimeError("run train_matcher before stack")
@@ -333,6 +355,7 @@ def stage_stack(cfg):
 
 
 def stage_decide(cfg):
+    banner("decide")
     feats = load_parquet(cache_dir(cfg) / "val_features.parquet")
     _, val_s1, _, gt, *_ = _holdout_frames(cfg)
     tmap = _truth(gt)
@@ -362,11 +385,14 @@ def stage_decide(cfg):
         "holdout": macro_f05(pred, tmap, s1_ids),
     }
     write_json(Path(cfg.paths.reports_dir) / "decision.json", metrics)
+    LOG.info("decision rule=%s  tau=%.3f  holdout_F0.5=%.4f",
+             cfg.decision.rule, tau, metrics["holdout"]["macro_f05"])
     _log(cfg, "decide", "Hold-out decision-rule comparison.", metrics)
     return metrics
 
 
 def stage_evaluate(cfg):
+    banner("evaluate")
     _self_test()
     feats = load_parquet(cache_dir(cfg) / "val_features.parquet")
     _, val_s1, _, gt, splits, s1n, *_ = _holdout_frames(cfg)
@@ -392,14 +418,18 @@ def stage_evaluate(cfg):
         loco[c] = macro_f05(pred, tmap, ids)
     metrics["loco_on_holdout"] = loco
     write_json(Path(cfg.paths.reports_dir) / "evaluate.json", metrics)
-    _log(cfg, "evaluate", "Hold-out + per-country + LOCO-on-holdout F0.5.", metrics)
-    print(json.dumps(metrics, indent=2, default=str))
+    LOG.info("holdout macro F0.5 = %.4f  over %s S1 entities",
+             metrics["holdout"]["macro_f05"], metrics["holdout"]["n_entities"])
+    _log(cfg, "evaluate", "Hold-out + per-country F0.5.", metrics)
     return metrics
 
 
 def _predict_split(cfg, s1, gallery, split_name: str, out_match: Path, out_cand: Path):
-    """Encode → block → features → score → decide. Used for test (and optionally full train)."""
+    """Encode → block → features → score → decide. Writes PDF output TSVs."""
+    banner(f"predict:{split_name}")
+    LOG.info("predict  S1=%s  gallery=%s  → %s", f"{len(s1):,}", f"{len(gallery):,}", out_match)
     tag = "ft" if (Path(cfg.paths.models_dir) / "biencoder" / "merged").exists() else "zs"
+    LOG.info("embedding tag=%s", tag)
     model = None
     try:
         adapter = Path(cfg.paths.models_dir) / "biencoder" / "merged"
@@ -423,7 +453,7 @@ def _predict_split(cfg, s1, gallery, split_name: str, out_match: Path, out_cand:
         keep = [i for i, eid in enumerate(gal_ids) if eid in gal_map.index]
         gal_emb = gal_emb[keep]
     except Exception as exc:
-        print(f"[predict] embeddings unavailable ({exc}); lexical blocking only")
+        LOG.warning("embeddings unavailable (%s); lexical blocking only", exc)
         s1_emb = gal_emb = None
         gal_aligned = gallery
 
@@ -475,11 +505,14 @@ def _predict_split(cfg, s1, gallery, split_name: str, out_match: Path, out_cand:
     scored_map = feats.groupby("s1_id")["cand_id"].apply(list).to_dict()
     write_candidate_pairs(s1_ids, scored_map, out_cand)
     write_matching_results(s1_ids, pred, out_match)
+    LOG.info("wrote %s  and  %s  (rows=%s  predicted links=%s)",
+             out_match, out_cand, f"{len(s1_ids):,}", f"{sum(len(v) for v in pred.values()):,}")
     save_parquet(feats, cache_dir(cfg) / f"{split_name}_scored.parquet")
     return {"blocking": bmetrics, "n_s1": len(s1_ids), "n_pred_links": sum(len(v) for v in pred.values())}
 
 
 def stage_predict(cfg):
+    banner("predict")
     t1 = pd.read_parquet(norm_path(cfg, "test", "s1"))
     t2 = pd.read_parquet(norm_path(cfg, "test", "s2"))
     t3 = pd.read_parquet(norm_path(cfg, "test", "s3"))
@@ -507,22 +540,34 @@ def stage_predict(cfg):
             "matches_not_in_candidates": leak,
         }
     )
-    write_json(Path(cfg.paths.reports_dir) / "predict.json", metrics)
+    LOG.info(
+        "sanity  output_rows=%s  test_S1=%s  France_S1=%s  France_singleton_rate=%.3f  matches_not_in_candidates=%s",
+        metrics["n_output_rows"], metrics["n_test_s1"], metrics["n_france_s1"],
+        metrics["france_pred_singleton_rate"], metrics["matches_not_in_candidates"],
+    )
+    if metrics["n_output_rows"] != metrics["n_test_s1"]:
+        LOG.error("PDF rule failed: every test S1 must have exactly one output row")
+    if metrics["matches_not_in_candidates"]:
+        LOG.warning("matches not in candidate_pairs.tsv — validator will warn")
     _log(cfg, "predict", "Test inference → output/*.tsv.", metrics)
 
-    # validator
+    # PDF validator (stdlib). Default omits --check-ids (memory); format rules still run.
     cmd = [
         sys.executable, "utils/validate_submission.py",
         "--matching", str(out_dir / "matching_results.tsv"),
         "--candidate", str(out_dir / "candidate_pairs.tsv"),
         "--test-dir", str(cfg.paths.test_dir),
-        "--check-ids",
     ]
-    print("running", " ".join(cmd))
+    LOG.info("validator: %s", " ".join(cmd))
     proc = subprocess.run(cmd, capture_output=True, text=True)
-    print(proc.stdout)
+    if proc.stdout:
+        LOG.info("%s", proc.stdout.strip())
     if proc.stderr:
-        print(proc.stderr)
+        LOG.warning("%s", proc.stderr.strip())
+    if proc.returncode == 0:
+        LOG.info("validator PASS")
+    else:
+        LOG.error("validator FAIL (exit %s)", proc.returncode)
     metrics["validator_exit"] = proc.returncode
     metrics["validator_stdout"] = proc.stdout
     write_json(Path(cfg.paths.reports_dir) / "predict.json", metrics)
@@ -530,6 +575,7 @@ def stage_predict(cfg):
 
 
 def stage_all(cfg):
+    LOG.info("running full pipeline  eda → … → predict")
     stage_eda(cfg)
     stage_split(cfg)
     stage_normalize(cfg)
@@ -537,19 +583,19 @@ def stage_all(cfg):
     if cfg.biencoder.enabled and not cfg.debug.fast:
         try:
             stage_train_biencoder(cfg)
-        except Exception as exc:
-            _log(cfg, "train_biencoder", f"skipped / failed: {exc}", {"error": str(exc)})
+        except Exception:
+            LOG.exception("train_biencoder failed — continuing with zero-shot embeddings")
     stage_features(cfg)
     stage_train_matcher(cfg)
     if cfg.cross_encoder.enabled and not cfg.debug.fast:
         try:
             stage_train_crossencoder(cfg)
-        except Exception as exc:
-            _log(cfg, "train_crossencoder", f"skipped / failed: {exc}", {"error": str(exc)})
+        except Exception:
+            LOG.exception("train_crossencoder failed — continuing with LightGBM scores only")
     try:
         stage_stack(cfg)
-    except Exception as exc:
-        _log(cfg, "stack", f"skipped / failed: {exc}", {"error": str(exc)})
+    except Exception:
+        LOG.exception("stacker failed — decision will use p_gbm")
     stage_decide(cfg)
     stage_evaluate(cfg)
     return stage_predict(cfg)
@@ -576,17 +622,21 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Business entity resolution pipeline")
     p.add_argument("--stage", required=True, choices=STAGES)
     p.add_argument("--config", default="configs/default.yaml")
+    p.add_argument("--quiet", action="store_true", help="INFO only (hide DEBUG cache lines)")
     args = p.parse_args(argv)
+    setup_logging(verbose=not args.quiet)
     cfg = load_config(args.config)
     set_seeds(int(cfg.seed))
     hw = apply_auto_batch(cfg)
     Path(cfg.paths.output_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.paths.reports_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.paths.models_dir).mkdir(parents=True, exist_ok=True)
-    print(f"backbone={cfg.backbone.preset} repo={cfg.backbone.repo} prefix={cfg.backbone.prefix!r}")
-    print(f"hardware={hw}")
-    _log(cfg, args.stage, f"start stage={args.stage} config={cfg._path}", {"hardware": hw, "backbone": as_dict(cfg)["backbone"]})
+    LOG.info("config=%s  seed=%s", cfg._path, cfg.seed)
+    LOG.info("backbone=%s  repo=%s  prefix=%r", cfg.backbone.preset, cfg.backbone.repo, cfg.backbone.prefix)
+    LOG.info("hardware %s", hw)
+    _log(cfg, args.stage, f"start stage={args.stage}", {"hardware": hw, "backbone": as_dict(cfg)["backbone"]})
     DISPATCH[args.stage](cfg)
+    LOG.info("finished --stage %s", args.stage)
     return 0
 
 

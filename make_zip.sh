@@ -28,10 +28,6 @@ else
   cp PIPELINE.md "$STAGE/code/business_entity_resolution/README.md"
 fi
 cp Documentation_template.md "$STAGE/"
-# keep licence + experiment logs for reviewers
-mkdir -p "$STAGE/code/business_entity_resolution/reports"
-[[ -f reports/licences.md ]] && cp reports/licences.md "$STAGE/code/business_entity_resolution/reports/"
-[[ -f experiments.md ]] && cp experiments.md "$STAGE/code/business_entity_resolution/"
 
 ZIP="${TEAM}_submission.zip"
 rm -f "$ZIP"

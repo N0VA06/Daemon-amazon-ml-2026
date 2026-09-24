@@ -8,8 +8,10 @@ import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz
 from rapidfuzz.distance import JaroWinkler
+from tqdm.auto import tqdm
 
 from src.io_utils import source_flag
+from src.logging_utils import LOG
 from src.normalize import idf_token_jaccard, tokens
 
 
@@ -241,7 +243,8 @@ def build_pair_features(
     g_map = gallery.set_index("entity_id", drop=False)
     chunks = []
     n = len(pairs)
-    for start in range(0, n, chunk):
+    LOG.info("pair features  n=%s  chunk=%s", f"{n:,}", f"{chunk:,}")
+    for start in tqdm(range(0, n, chunk), desc="pair features", leave=True):
         sl = pairs.iloc[start : start + chunk]
         recs = []
         for row in sl.itertuples(index=False):
@@ -254,6 +257,7 @@ def build_pair_features(
         extra = pd.DataFrame(recs)
         merged = sl.merge(extra, on=["s1_id", "cand_id"], how="left")
         chunks.append(merged)
+        LOG.debug("  features chunk %s–%s done", f"{start:,}", f"{min(start + chunk, n):,}")
     return pd.concat(chunks, ignore_index=True) if chunks else pairs.copy()
 
 

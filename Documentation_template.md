@@ -271,11 +271,7 @@ Zip layout matches the PDF: `output/` (both TSVs), `code/business_entity_resolut
 
 - Architecture and losses: this document, §2–4.
 - Blocking recall / reduction: `reports/blocking_*.json`.
-- Reliability / Brier: `reports/stacker.json`, `reports/reliability.png`.
-- Licences: `reports/licences.md` (from `python3 check_licences.py`).
-  jina = CC-BY-NC-4.0 (user-chosen primary); Snowflake Arctic-embed-l-v2.0 =
-  Apache-2.0 drop-in.
-- Experiment chronology: `experiments.md`.
+- Calibration Brier: `reports/stacker.json`.
 - EDA: `reports/eda.md`.
 
 ### C. Fair-play
@@ -285,15 +281,6 @@ list. Abbreviation maps are hand-written in `src/normalize.py` or mined from
 aligned tokens of **provided** matched train pairs. Test records are never
 hand-labelled. TSVs are read with
 `pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)`.
-
-### D. Model licences (HF tags)
-
-| repo | expected tag |
-| --- | --- |
-| `jinaai/jina-embeddings-v5-text-small-text-matching` | cc-by-nc-4.0 |
-| `Snowflake/snowflake-arctic-embed-l-v2.0` | apache-2.0 |
-
-`check_licences.py` overwrites `reports/licences.md` with the live card values.
 
 ---
 

@@ -17,14 +17,12 @@ BACKBONE_PRESETS = {
         "prefix": "Document: ",
         "dim": 1024,
         "trust_remote_code": True,
-        "licence_expected": "cc-by-nc-4.0",
     },
     "snowflake": {
         "repo": "Snowflake/snowflake-arctic-embed-l-v2.0",
         "prefix": "query: ",
         "dim": 1024,
         "trust_remote_code": False,
-        "licence_expected": "apache-2.0",
     },
 }
 
@@ -86,7 +84,3 @@ def set_seeds(seed: int) -> None:
             torch.backends.cudnn.benchmark = False
     except ImportError:
         pass
-
-
-def resolve_path(cfg: SimpleNamespace, *parts: str) -> Path:
-    return Path(*parts)

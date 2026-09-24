@@ -12,7 +12,7 @@ from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss
 
-from src.logging_utils import write_json
+from src.logging_utils import LOG, write_json
 
 
 def _logit(p: np.ndarray) -> np.ndarray:
@@ -134,5 +134,6 @@ def run_stack_and_calibrate(df: pd.DataFrame, cfg, reports_dir: Path) -> tuple[p
         "n": int(len(labelled)),
     }
     write_json(reports_dir / "stacker.json", metrics)
+    LOG.info("stacker  n=%s  brier_raw=%.4f  brier_cal=%.4f", metrics["n"], metrics["brier_raw"], metrics["brier_cal"])
     bundle["metrics"] = metrics
     return out, bundle

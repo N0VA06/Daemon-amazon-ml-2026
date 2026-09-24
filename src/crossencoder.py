@@ -21,7 +21,7 @@ from torch.optim import AdamW
 from tqdm import tqdm
 
 from src.embeddings import load_sentence_transformer, get_auto_model
-from src.logging_utils import write_json
+from src.logging_utils import LOG, write_json
 
 
 def pair_text(prefix: str, a: pd.Series, b: pd.Series) -> str:
@@ -138,6 +138,8 @@ def train_crossencoder(
         neg = neg.sample(n=n_neg, random_state=int(cfg.seed)) if n_neg < len(neg) else neg
         train_df = pd.concat([pos, neg], ignore_index=True)
     train_df = train_df.sample(frac=1.0, random_state=int(cfg.seed)).reset_index(drop=True)
+    LOG.info("cross-encoder  device=%s  train=%s  pos=%s  batch=%s  max_len=%s",
+             device, f"{len(train_df):,}", f"{len(pos):,}", cfg.cross_encoder.batch_size, cfg.cross_encoder.max_length)
 
     texts, y = build_ce_texts(
         train_df, s1, gallery, cfg.backbone.prefix,

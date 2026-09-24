@@ -16,7 +16,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 from src.evaluate import recall_at_k_curve
 from src.io_utils import write_candidate_pairs
-from src.logging_utils import write_json
+from src.logging_utils import LOG, write_json
 
 try:
     import faiss
@@ -298,8 +298,14 @@ def run_blocking(
     same = bool(b.same_country_only)
     maps = []
     named: dict[str, dict] = {}
+    LOG.info(
+        "blocking tag=%s  S1=%s  gallery=%s  same_country=%s  k_faiss=%s k_tfidf=%s k_key=%s cap=%s",
+        tag, f"{len(s1):,}", f"{len(gallery):,}", same,
+        b.k_faiss, b.k_tfidf, b.k_key, b.k_cap,
+    )
 
     if s1_emb is not None and gal_emb is not None:
+        LOG.info("blocker A  FAISS %s  dim=%s", b.faiss_index, s1_emb.shape[1])
         faiss_map = block_faiss_by_country(
             s1, gallery, s1_emb, gal_emb,
             k=int(b.k_faiss),
@@ -310,7 +316,9 @@ def run_blocking(
         )
         maps.append(faiss_map)
         named["faiss"] = faiss_map
+        LOG.info("blocker A  done  (queries with hits=%s)", sum(1 for v in faiss_map.values() if v))
 
+    LOG.info("blocker B  char TF-IDF %s–%s grams", b.tfidf_ngram_min, b.tfidf_ngram_max)
     tfidf_map = block_tfidf_name(
         s1, gallery,
         k=int(b.k_tfidf),
@@ -325,16 +333,20 @@ def run_blocking(
     )
     maps.append(tfidf_map)
     named["tfidf"] = tfidf_map
+    LOG.info("blocker B  done")
 
+    LOG.info("blocker C  rare name token | postcode+house")
     key_map = block_keys(
         s1, gallery, idf, float(b.rare_token_idf_quantile), int(b.k_key), same
     )
     maps.append(key_map)
     named["key"] = key_map
+    LOG.info("blocker C  done")
 
     s1_ids = s1["entity_id"].astype(str).tolist()
     cand_map = union_cap(maps, s1_ids, int(b.k_cap))
     pairs = candidates_to_pairs(cand_map, named)
+    LOG.info("union cap=%s  pairs=%s  avg/S1=%.1f", b.k_cap, f"{len(pairs):,}", len(pairs) / max(len(s1_ids), 1))
 
     metrics: dict = {
         "n_s1": len(s1_ids),
@@ -354,6 +366,10 @@ def run_blocking(
         from src.evaluate import blocking_recall
 
         metrics["blocking"] = blocking_recall(cand_map, truth_map, s1_ids)
+        LOG.info("blocking pair-recall=%.4f  entity-recall=%.4f  R@10_union=%s",
+                 metrics["blocking"]["pair_recall"],
+                 metrics["blocking"]["entity_recall"],
+                 metrics["recall_at_k_union"].get(10))
 
     if out_tsv is not None:
         write_candidate_pairs(s1_ids, cand_map, out_tsv)

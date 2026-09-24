@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
+from tqdm.auto import tqdm
 
 # ---------------------------------------------------------------------------
 # Legal forms (extracted into their own field; stripped from core_name)
@@ -493,7 +494,7 @@ def normalize_frame(
 ) -> pd.DataFrame:
     rows = [
         normalize_row(r.business_name, r.business_address, r.country, extra_abbrev)
-        for r in df.itertuples(index=False)
+        for r in tqdm(df.itertuples(index=False), total=len(df), desc="normalize rows", leave=False)
     ]
     extra = pd.DataFrame(rows)
     out = pd.concat([df.reset_index(drop=True), extra], axis=1)

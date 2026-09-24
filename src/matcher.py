@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from src.features import feature_columns
+from src.logging_utils import LOG
 
 
 def _monotone_vector(cols: list[str], mapping: dict) -> list[int]:
@@ -125,6 +126,7 @@ def oof_train_matcher(
         tr_s = subsample_negatives(
             tr, float(cfg.matcher.negative_sample_ratio), int(cfg.seed) + k, hard
         )
+        LOG.info("LightGBM fold %s/%s  train=%s  valid=%s", k + 1, n_folds, f"{len(tr_s):,}", f"{len(va):,}")
         model, feature_cols = train_lgbm(tr_s, va, cfg, feature_cols)
         df.loc[va.index, "p_gbm"] = predict_lgbm(model, va, feature_cols)
         last_model = model
@@ -135,6 +137,7 @@ def oof_train_matcher(
     all_s = subsample_negatives(
         df.dropna(subset=["label"]), float(cfg.matcher.negative_sample_ratio), int(cfg.seed), hard
     )
+    LOG.info("LightGBM final model on %s labelled pairs, %s features", f"{len(all_s):,}", len(feature_cols))
     final, feature_cols = train_lgbm(all_s, None, cfg, feature_cols)
     # fill any missing OOF with the final model
     miss = df["p_gbm"].isna()

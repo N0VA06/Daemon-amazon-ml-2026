@@ -1,0 +1,28 @@
+# Data — keep the folder locally; do not commit the TSVs
+dataset/**/*.tsv
+benchmark_results/
+
+# Pipeline artifacts
+cache/
+models/
+output/
+*.zip
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Generated artifacts
+*.npy
+*.parquet
+*.joblib
+*.pt
+*.png
+
+.DS_Store

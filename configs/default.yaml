@@ -1,0 +1,176 @@
+# Business Entity Resolution — default config
+# Swap the backbone with one key: set backbone.preset to "snowflake"
+# or override backbone.repo / backbone.prefix.
+
+seed: 42
+team_name: team_jina_er
+
+paths:
+  train_dir: dataset/train
+  test_dir: dataset/test
+  cache_dir: cache
+  output_dir: output
+  reports_dir: reports
+  models_dir: models
+  experiments_log: experiments.md
+
+# ---------------------------------------------------------------------------
+# Backbone (single swap point)
+# ---------------------------------------------------------------------------
+backbone:
+  preset: jina                 # jina | snowflake
+  # jina (text-matching LoRA merged into Qwen3-0.6B, 1024-d, last-token pool)
+  repo: jinaai/jina-embeddings-v5-text-small-text-matching
+  prefix: "Document: "         # same prefix on BOTH sides, train + inference
+  max_seq_length: 128
+  dim: 1024
+  normalize: true
+  dtype: bfloat16              # model_kwargs={"dtype": torch.bfloat16}
+  trust_remote_code: true
+  # Matryoshka truncation for fast blocking (optional)
+  matryoshka_dims: [1024, 512, 256]
+  encode_views: [combined, name, address]
+  record_template: "{name} | {address} | {country}"
+
+# Tested drop-in (Apache-2.0). Copy these three keys or use --config configs/snowflake.yaml
+# backbone.preset: snowflake
+# backbone.repo: Snowflake/snowflake-arctic-embed-l-v2.0
+# backbone.prefix: "query: "
+
+split:
+  val_frac: 0.20
+  n_folds: 3
+  stratify_cols: [country, is_singleton]
+  # Unlinked S2/S3 share added to the val gallery so train:test size ratios match
+  gallery_unlinked_frac: 0.20
+
+normalize:
+  nfkc: true
+  lowercase: true
+  keep_raw: true
+  amp_to_and: true
+  compute_idf: true            # IDF over ALL source files (train+test) when true
+  mine_abbreviations: true     # aligned-token substitutions from matched train pairs
+  min_abbrev_count: 8
+
+blocking:
+  same_country_only: true      # matches in train share country; France still works
+  k_faiss: 50
+  k_tfidf: 30
+  k_key: 20
+  k_cap: 80                    # union, then cap per S1
+  tfidf_analyzer: char
+  tfidf_ngram_min: 2
+  tfidf_ngram_max: 4
+  tfidf_max_features: 200000
+  tfidf_min_df: 3
+  tfidf_svd_dim: 256           # sparse TF-IDF → SVD → FAISS
+  rare_token_idf_quantile: 0.70
+  faiss_index: ivf             # flat | ivf | hnsw
+  faiss_nlist: 4096
+  faiss_nprobe: 32
+  faiss_use_zero_shot: true    # Stage 3 baseline
+  faiss_use_finetuned: true    # Stage 4+
+
+features:
+  compute_zero_shot_cosine: true
+  compute_finetuned_cosine: true
+  chunk_pairs: 100000
+
+matcher:
+  objective: binary
+  metric: binary_logloss
+  n_estimators: 800
+  learning_rate: 0.05
+  num_leaves: 63
+  min_child_samples: 50
+  subsample: 0.8
+  colsample_bytree: 0.8
+  early_stopping_rounds: 50
+  negative_sample_ratio: 8     # keep all hard negatives
+  n_jobs: -1
+  # LightGBM monotone: 1 increasing, -1 decreasing
+  # applied to named columns below
+  monotone:
+    house_num_mismatch: -1
+    postcode_mismatch: -1
+    name_rf_ratio: 1
+    name_rf_token_set: 1
+    core_rf_token_set: 1
+    cosine_combined: 1
+
+biencoder:
+  enabled: true
+  full_finetune: false         # ablation only; default is LoRA
+  lora_r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  temperature: 0.05            # τ; scale = 1/τ = 20
+  scale: 20
+  effective_batch_size: 512
+  mini_batch_size: 32
+  lr: 1.0e-4                   # 2e-5 if full_finetune
+  full_finetune_lr: 2.0e-5
+  warmup_ratio: 0.10
+  phase_a_epochs: 2
+  phase_b_epochs: 1
+  hard_negatives_per_anchor: 2
+  max_train_pairs: 400000
+  max_hard_neg_pool: 80
+  use_matryoshka: true
+  use_entity_aware_sampler: true
+  use_gist_fallback: true
+  gist_guide_frozen: true
+  no_duplicates: true
+  gradient_checkpointing: true
+  phase_b_aux_loss: cosent     # cosent | online_contrastive
+  online_contrastive_margin: 0.5
+  cosent_lambda: 20.0
+  eval_ks: [1, 10, 50]
+  train_per_fold: true         # OOF: no feature from a model that saw that pair
+
+cross_encoder:
+  enabled: true
+  top_n: 10
+  max_length: 256
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lr: 1.0e-4
+  epochs: 2
+  batch_size: 16
+  negative_sample_ratio: 8
+  loss: bce                    # bce | focal
+  focal_gamma: 2.0
+  swap_order: true
+
+stacker:
+  enabled: true
+  C: 1.0
+  max_iter: 200
+  calibration: isotonic
+
+decision:
+  rule: expected_f05           # global | relative | expected_f05
+  global_threshold: 0.55
+  relative_alpha: 0.85
+  one_to_one: true
+  compare_all_rules: true      # Stage 6 ablation on OOF / hold-out
+
+hardware:
+  auto_batch: true
+  encode_batch_size: 64        # overwritten by GPU detect when auto_batch
+  faiss_gpu: false
+
+debug:
+  max_s1: null                 # set an int to subsample S1 for a dry run
+  max_gallery: null
+  fast: false

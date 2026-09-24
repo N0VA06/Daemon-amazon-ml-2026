@@ -1,0 +1,28 @@
+# Pinned environment for the Business Entity Resolution pipeline.
+# Backbone (jina-embeddings-v5-text-small) requires these floors:
+#   transformers>=5.1.0  torch>=2.8.0  peft>=0.15.2
+# flash-attn is optional and not pinned.
+
+torch==2.8.0
+transformers==5.1.0
+peft==0.17.1
+sentence-transformers==5.1.1
+accelerate==1.10.1
+huggingface_hub==0.34.4
+safetensors==0.5.3
+tokenizers==0.21.4
+
+faiss-cpu==1.11.0
+rapidfuzz==3.13.0
+lightgbm==4.6.0
+scikit-learn==1.7.1
+pandas==2.2.3
+pyarrow==21.0.0
+numpy==2.2.6
+scipy==1.16.1
+pyyaml==6.0.2
+tqdm==4.67.1
+joblib==1.5.1
+matplotlib==3.10.6
+filelock==3.18.0
+pytest==8.4.1

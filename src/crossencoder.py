@@ -58,7 +58,7 @@ def _attach_lora_ce(auto, cfg):
 class JinaCrossEncoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        st = load_sentence_transformer(cfg)
+        st = load_sentence_transformer(cfg, use_cache=False)
         auto = get_auto_model(st)
         self.tokenizer = st.tokenizer
         self.backbone = _attach_lora_ce(auto, cfg)
@@ -230,9 +230,11 @@ def load_crossencoder(cfg, ckpt_dir: Path) -> JinaCrossEncoder:
     model = JinaCrossEncoder(cfg)
     blob = torch.load(ckpt_dir / "crossencoder.pt", map_location="cpu")
     model.head.load_state_dict(blob["head"])
-    try:
-        model.backbone.load_state_dict(blob["backbone"])
-    except Exception:
-        pass
+    missing, unexpected = model.backbone.load_state_dict(blob["backbone"], strict=False)
+    if missing or unexpected:
+        print(
+            f"[crossencoder] load_state_dict(strict=False) "
+            f"missing={list(missing)[:8]} unexpected={list(unexpected)[:8]}"
+        )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return model.to(device)

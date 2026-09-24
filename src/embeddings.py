@@ -33,13 +33,18 @@ def _torch_dtype(name: str):
 def load_sentence_transformer(
     cfg: SimpleNamespace,
     adapter_path: str | Path | None = None,
+    use_cache: bool = True,
 ):
-    """Load the configured backbone. adapter_path is an optional LoRA / merged dir."""
+    """Load the configured backbone. adapter_path is an optional LoRA / merged dir.
+
+    Training code that mutates the module (LoRA) must pass use_cache=False so a
+    later zero-shot encode does not receive the adapted weights.
+    """
     from sentence_transformers import SentenceTransformer
 
     repo = adapter_path or cfg.backbone.repo
     key = str(repo)
-    if key in _MODEL_CACHE:
+    if use_cache and key in _MODEL_CACHE:
         return _MODEL_CACHE[key]
 
     import torch
@@ -61,14 +66,13 @@ def load_sentence_transformer(
             pass
 
     model.max_seq_length = int(cfg.backbone.max_seq_length)
-    _MODEL_CACHE[key] = model
+    if use_cache:
+        _MODEL_CACHE[key] = model
     return model
 
 
 def get_auto_model(st_model):
     """Best-effort handle for the underlying HF decoder (LoRA / CE head)."""
-    for attr in ("auto_model", "model", "_modules"):
-        pass
     try:
         return st_model[0].auto_model
     except Exception:

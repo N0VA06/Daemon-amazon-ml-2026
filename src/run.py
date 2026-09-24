@@ -26,7 +26,12 @@ from src.features import (
     save_parquet,
 )
 from src.hardware import apply_auto_batch
-from src.io_utils import gt_to_map, write_candidate_pairs, write_matching_results
+from src.io_utils import (
+    gt_to_map,
+    read_id_list_tsv,
+    write_candidate_pairs,
+    write_matching_results,
+)
 from src.logging_utils import log_experiment, write_json
 from src.matcher import load_matcher, oof_train_matcher, predict_lgbm, save_matcher
 from src.pipeline import (
@@ -141,10 +146,6 @@ def _ensure_embeddings(cfg, df, split, source, tag, model=None):
 def stage_block(cfg, tag: str | None = None):
     """Blocking on the hold-out validation split (and later on test via predict)."""
     train_s1, val_s1, val_gal, gt, splits, *_ = _holdout_frames(cfg)
-    truth = {s: set(gt.set_index("source1_entity_id").loc[s].matched_list)
-             if s in set(gt["source1_entity_id"]) else set()
-             for s in val_s1["entity_id"]}
-    # rebuild truth properly
     tmap = _truth(gt)
 
     # zero-shot embeddings
@@ -202,8 +203,6 @@ def stage_train_biencoder(cfg):
     zs_s1 = zs_gal = None
     try:
         model = load_sentence_transformer(cfg)
-        _ensure_embeddings(cfg, train_s1, "trainhold", "s1", "zs", model)
-        g2 = val_gal  # use full train gallery for mining
         train_gal = gallery_of(s2n, s3n)
         if getattr(cfg.debug, "max_gallery", None):
             train_gal = train_gal.sample(
@@ -434,7 +433,7 @@ def _predict_split(cfg, s1, gallery, split_name: str, out_match: Path, out_cand:
         out_tsv=out_cand, tag=f"{split_name}_{tag}", truth_map=None,
     )
     feats = build_pair_features(pairs, s1, gal_aligned, idf, int(cfg.features.chunk_pairs))
-    feats = _add_cosines(cfg, feats, s1, gal_aligned, split_name, split_name, tag, "ft" if tag == "ft" else "zs")
+    feats = _add_cosines(cfg, feats, s1, gal_aligned, split_name, split_name, tag, tag)
     score_cols = [c for c in feats.columns if c.startswith("score_") or c.startswith("cosine_")]
     feats = add_rank_context_features(feats, score_cols)
 
@@ -493,12 +492,8 @@ def stage_predict(cfg):
     )
     # sanity: one row per test S1, France included
     s1_ids = t1["entity_id"].astype(str).tolist()
-    pred = __import__("src.io_utils", fromlist=["read_id_list_tsv"]).read_id_list_tsv(
-        out_dir / "matching_results.tsv", "matched_entity_ids"
-    )
-    cand = __import__("src.io_utils", fromlist=["read_id_list_tsv"]).read_id_list_tsv(
-        out_dir / "candidate_pairs.tsv", "candidate_entity_ids"
-    )
+    pred = read_id_list_tsv(out_dir / "matching_results.tsv", "matched_entity_ids")
+    cand = read_id_list_tsv(out_dir / "candidate_pairs.tsv", "candidate_entity_ids")
     n_fr = int((t1["country"].astype(str).str.lower() == "france").sum())
     fr_ids = t1.loc[t1["country"].astype(str).str.lower() == "france", "entity_id"].astype(str)
     fr_single = sum(1 for i in fr_ids if not pred.get(i))

@@ -312,7 +312,7 @@ def train_biencoder(
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     device = _device()
-    st_model = load_sentence_transformer(cfg)
+    st_model = load_sentence_transformer(cfg, use_cache=False)
     st_model = attach_lora(st_model, cfg)
     st_model.to(device)
     st_model.train()

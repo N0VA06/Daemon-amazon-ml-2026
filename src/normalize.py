@@ -114,7 +114,6 @@ ABBREV_US = {
     "nw": "northwest",
     "se": "southeast",
     "sw": "southwest",
-    "hwy": "highway",
     "fwy": "freeway",
     "expy": "expressway",
     "tpke": "turnpike",

@@ -5,12 +5,21 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from src.blocking import run_blocking
+from src.checkpoint import (
+    PIPELINE_STAGES,
+    is_complete,
+    log_artifact_status,
+    mark_stage,
+    print_status,
+    stage_enabled,
+)
 from src.config import as_dict, load_config, set_seeds
 from src.decision import apply_decision, compare_rules, sweep_global_threshold
 from src.eda import run_eda
@@ -31,18 +40,26 @@ from src.io_utils import (
     write_candidate_pairs,
     write_matching_results,
 )
-from src.logging_utils import LOG, banner, log_experiment, setup_logging, write_json
+from src.logging_utils import (
+    LOG,
+    banner,
+    default_log_path,
+    fmt_elapsed,
+    log_experiment,
+    setup_logging,
+    write_json,
+)
 from src.matcher import load_matcher, oof_train_matcher, predict_lgbm, save_matcher
 from src.pipeline import (
+    all_normalized_cached,
     build_all_normalized,
     build_splits,
     cache_dir,
+    cached_normalized_counts,
     concat_gallery_emb,
     encode_split_views,
     gallery_of,
     load_idf_if_any,
-    load_or_build_normalized,
-    load_test,
     load_train,
     load_view,
     norm_path,
@@ -70,6 +87,56 @@ STAGES = (
 def _log(cfg, stage: str, message: str, metrics=None):
     LOG.info("%s", message)
     log_experiment(cfg.paths.experiments_log, stage, message, metrics)
+
+
+def _force_stage(cfg, stage: str) -> bool:
+    if bool(getattr(cfg, "_force", False)):
+        return True
+    start = getattr(cfg, "_force_from", None)
+    if not start:
+        return False
+    try:
+        return PIPELINE_STAGES.index(stage) >= PIPELINE_STAGES.index(start)
+    except ValueError:
+        return False
+
+
+def _should_skip(cfg, stage: str) -> bool:
+    if not bool(getattr(cfg, "_resume", True)):
+        return False
+    if _force_stage(cfg, stage):
+        return False
+    if not is_complete(cfg, stage):
+        return False
+    LOG.info("RESUME skip  %s  (artifacts already on disk)", stage)
+    log_artifact_status(cfg, stage)
+    mark_stage(cfg, stage, "skipped", reason="artifacts_exist")
+    return True
+
+
+def _run_named(cfg, stage: str, fn, optional: bool = False):
+    if not stage_enabled(cfg, stage):
+        LOG.info("skip %s  (disabled in config)", stage)
+        mark_stage(cfg, stage, "disabled")
+        return None
+    if _should_skip(cfg, stage):
+        return None
+    mark_stage(cfg, stage, "running")
+    t0 = time.perf_counter()
+    try:
+        metrics = fn(cfg)
+    except Exception as exc:
+        elapsed = time.perf_counter() - t0
+        mark_stage(cfg, stage, "failed", elapsed_s=elapsed, error=str(exc))
+        if optional:
+            LOG.exception("%s failed after %s — continuing", stage, fmt_elapsed(elapsed))
+            return None
+        raise
+    elapsed = time.perf_counter() - t0
+    mark_stage(cfg, stage, "done", elapsed_s=elapsed, metrics=metrics)
+    LOG.info("stage %s finished in %s", stage, fmt_elapsed(elapsed))
+    log_artifact_status(cfg, stage)
+    return metrics
 
 
 def _truth(gt) -> dict:
@@ -106,8 +173,11 @@ def stage_split(cfg):
         s2, s3, gt, list(val_s1), list(train_s1),
         float(cfg.split.gallery_unlinked_frac), int(cfg.seed),
     )
-    g2.to_parquet(cache_dir(cfg) / "val_gallery_s2.parquet", index=False)
-    g3.to_parquet(cache_dir(cfg) / "val_gallery_s3.parquet", index=False)
+    g2_path = cache_dir(cfg) / "val_gallery_s2.parquet"
+    g3_path = cache_dir(cfg) / "val_gallery_s3.parquet"
+    g2.to_parquet(g2_path, index=False)
+    g3.to_parquet(g3_path, index=False)
+    LOG.info("wrote %s  (%s rows)  and  %s  (%s rows)", g2_path, f"{len(g2):,}", g3_path, f"{len(g3):,}")
     metrics = {
         "n_train_s1": len(payload["holdout_train"]),
         "n_val_s1": len(payload["holdout_val"]),
@@ -124,8 +194,17 @@ def stage_split(cfg):
 
 def stage_normalize(cfg):
     banner("normalize")
+    if all_normalized_cached(cfg) and not _force_stage(cfg, "normalize"):
+        metrics = cached_normalized_counts(cfg)
+        LOG.info("all 6 normalized parquets + idf already on disk — nothing to rebuild")
+        for k, n in metrics.items():
+            LOG.info("  %s = %s", k, f"{n:,}" if isinstance(n, int) and n > 1 else n)
+        _log(cfg, "normalize", "Reused cache/normalized/ (resume).", metrics)
+        return metrics
     frames = build_all_normalized(cfg)
-    metrics = {k: int(len(v)) for k, v in frames.items()}
+    metrics = {}
+    for k, v in frames.items():
+        metrics[k] = int(len(v)) if isinstance(v, pd.DataFrame) else int(v)
     metrics["idf"] = bool((cache_dir(cfg) / "idf.json").exists())
     _log(cfg, "normalize", "Normalised tables cached under cache/normalized/.", metrics)
     return metrics
@@ -203,7 +282,9 @@ def stage_block(cfg, tag: str | None = None):
         tag=f"val_{tag}",
         truth_map=tmap,
     )
-    save_parquet(pairs, cache_dir(cfg) / f"val_pairs_{tag}.parquet")
+    out_p = cache_dir(cfg) / f"val_pairs_{tag}.parquet"
+    save_parquet(pairs, out_p)
+    LOG.info("blocking %s  pairs=%s  → %s", tag, f"{len(pairs):,}", out_p)
     _log(cfg, "block", f"Validation blocking ({tag}).", metrics)
     return metrics
 
@@ -215,30 +296,20 @@ def stage_train_biencoder(cfg):
     train_s1, val_s1, val_gal, gt, splits, s1n, s2n, s3n = _holdout_frames(cfg)
     tmap = _truth(gt)
     train_gt = gt[gt["source1_entity_id"].isin(set(train_s1["entity_id"]))]
-    # zero-shot embs for hard-neg mining if present
-    zs_s1 = zs_gal = None
-    try:
-        model = load_sentence_transformer(cfg)
-        train_gal = gallery_of(s2n, s3n)
-        if getattr(cfg.debug, "max_gallery", None):
-            train_gal = train_gal.sample(
-                n=min(int(cfg.debug.max_gallery), len(train_gal)), random_state=int(cfg.seed)
-            )
-        _ensure_embeddings(cfg, train_s1, "trainhold", "s1", "zs", model)
-        g2t = train_gal[train_gal["entity_id"].astype(str).str.startswith("S2-")]
-        g3t = train_gal[train_gal["entity_id"].astype(str).str.startswith("S3-")]
-        _ensure_embeddings(cfg, g2t, "trainhold", "s2", "zs", model)
-        _ensure_embeddings(cfg, g3t, "trainhold", "s3", "zs", model)
-        zs_s1 = load_view(cfg, "trainhold", "s1", "combined", "zs")
-        zs_gal, _ = concat_gallery_emb(cfg, "trainhold", "combined", "zs")
-        train_gal = pd.concat([g2t, g3t], ignore_index=True)
-    except Exception as exc:
-        LOG.warning("zero-shot hard-neg mine skipped: %s", exc)
-        train_gal = gallery_of(s2n, s3n)
+    # Full S2/S3 texts for pair lookup only — never encoded for hard-neg mining.
+    train_gal = gallery_of(s2n, s3n)
+    if getattr(cfg.debug, "max_gallery", None):
+        train_gal = train_gal.sample(
+            n=min(int(cfg.debug.max_gallery), len(train_gal)), random_state=int(cfg.seed)
+        )
+    LOG.info(
+        "biencoder gallery texts=%s  (hard-neg mine will encode a subset, not all S2/S3)",
+        f"{len(train_gal):,}",
+    )
 
     out = Path(cfg.paths.models_dir) / "biencoder"
     metrics = train_biencoder(
-        cfg, train_s1, train_gal, train_gt, tmap, zs_s1, zs_gal, out,
+        cfg, train_s1, train_gal, train_gt, tmap, None, None, out,
         val_s1=val_s1, val_gallery=val_gal,
     )
     _log(cfg, "train_biencoder", "Phase A InfoNCE + Phase B remine/CoSENT.", metrics)
@@ -276,7 +347,11 @@ def stage_features(cfg):
         stage_block(cfg, tag="zs")
     pairs = load_parquet(pair_path)
     idf = load_idf_if_any(cfg)
-    feats = build_pair_features(pairs, val_s1, val_gal, idf, int(cfg.features.chunk_pairs))
+    feats = build_pair_features(
+        pairs, val_s1, val_gal, idf, int(cfg.features.chunk_pairs),
+        checkpoint_dir=cache_dir(cfg), name="val",
+        workers=int(getattr(cfg.features, "n_jobs", -1)),
+    )
     feats = label_pairs(feats, tmap)
     if cfg.features.compute_zero_shot_cosine:
         feats = _add_cosines(cfg, feats, val_s1, val_gal, "val", "val", "zs", "zs")
@@ -425,75 +500,102 @@ def stage_evaluate(cfg):
 
 
 def _predict_split(cfg, s1, gallery, split_name: str, out_match: Path, out_cand: Path):
-    """Encode → block → features → score → decide. Writes PDF output TSVs."""
+    """Encode → block → features → score → decide. Writes PDF output TSVs.
+
+    Intermediate: cache/{split}_pairs.parquet, cache/features/{split}/chunk_*.parquet,
+    cache/{split}_scored.parquet. Re-running after a kill reuses whatever is already there.
+    """
     banner(f"predict:{split_name}")
     LOG.info("predict  S1=%s  gallery=%s  → %s", f"{len(s1):,}", f"{len(gallery):,}", out_match)
+    force = _force_stage(cfg, "predict")
+    scored_p = cache_dir(cfg) / f"{split_name}_scored.parquet"
+    pairs_p = cache_dir(cfg) / f"{split_name}_pairs.parquet"
     tag = "ft" if (Path(cfg.paths.models_dir) / "biencoder" / "merged").exists() else "zs"
     LOG.info("embedding tag=%s", tag)
-    model = None
-    try:
-        adapter = Path(cfg.paths.models_dir) / "biencoder" / "merged"
-        model = load_sentence_transformer(cfg, adapter_path=adapter if adapter.exists() else None)
-        g2 = gallery[gallery["entity_id"].astype(str).str.startswith("S2-")]
-        g3 = gallery[gallery["entity_id"].astype(str).str.startswith("S3-")]
-        _ensure_embeddings(cfg, s1, split_name, "s1", tag, model)
-        _ensure_embeddings(cfg, g2, split_name, "s2", tag, model)
-        _ensure_embeddings(cfg, g3, split_name, "s3", tag, model)
-        s1_emb = load_view(cfg, split_name, "s1", "combined", tag)
-        gal_emb, _ = concat_gallery_emb(cfg, split_name, "combined", tag)
-        from src.embeddings import ids_path
 
-        gal_ids = []
-        for src in ("s2", "s3"):
-            p = ids_path(Path(cfg.paths.cache_dir), split_name, src)
-            if p.exists():
-                gal_ids.extend(np.load(p, allow_pickle=True).tolist())
-        gal_map = gallery.set_index("entity_id")
-        gal_aligned = gal_map.loc[[i for i in gal_ids if i in gal_map.index]].reset_index()
-        keep = [i for i, eid in enumerate(gal_ids) if eid in gal_map.index]
-        gal_emb = gal_emb[keep]
-    except Exception as exc:
-        LOG.warning("embeddings unavailable (%s); lexical blocking only", exc)
-        s1_emb = gal_emb = None
+    if scored_p.exists() and not force:
+        LOG.info("RESUME  reuse scored pairs  %s", scored_p)
+        feats = load_parquet(scored_p)
+        bmetrics = {"resumed": True, "n_pairs": int(len(feats))}
         gal_aligned = gallery
-
-    idf = load_idf_if_any(cfg)
-    cand_map, pairs, bmetrics = run_blocking(
-        cfg, s1, gal_aligned, s1_emb, gal_emb, idf,
-        out_tsv=out_cand, tag=f"{split_name}_{tag}", truth_map=None,
-    )
-    feats = build_pair_features(pairs, s1, gal_aligned, idf, int(cfg.features.chunk_pairs))
-    feats = _add_cosines(cfg, feats, s1, gal_aligned, split_name, split_name, tag, tag)
-    score_cols = [c for c in feats.columns if c.startswith("score_") or c.startswith("cosine_")]
-    feats = add_rank_context_features(feats, score_cols)
-
-    lgbm_path = Path(cfg.paths.models_dir) / "lgbm.joblib"
-    if lgbm_path.exists():
-        booster, cols = load_matcher(lgbm_path)
-        # missing columns → 0
-        for c in cols:
-            if c not in feats.columns:
-                feats[c] = 0.0
-        feats["p_gbm"] = predict_lgbm(booster, feats, cols)
+        idf = load_idf_if_any(cfg)
     else:
-        # lexical fallback score
-        feats["p_gbm"] = feats.get("name_rf_token_set", pd.Series(0, index=feats.index)).fillna(0)
+        model = None
+        try:
+            adapter = Path(cfg.paths.models_dir) / "biencoder" / "merged"
+            model = load_sentence_transformer(cfg, adapter_path=adapter if adapter.exists() else None)
+            g2 = gallery[gallery["entity_id"].astype(str).str.startswith("S2-")]
+            g3 = gallery[gallery["entity_id"].astype(str).str.startswith("S3-")]
+            _ensure_embeddings(cfg, s1, split_name, "s1", tag, model)
+            _ensure_embeddings(cfg, g2, split_name, "s2", tag, model)
+            _ensure_embeddings(cfg, g3, split_name, "s3", tag, model)
+            s1_emb = load_view(cfg, split_name, "s1", "combined", tag)
+            gal_emb, _ = concat_gallery_emb(cfg, split_name, "combined", tag)
+            from src.embeddings import ids_path
 
-    ce_dir = Path(cfg.paths.models_dir) / "crossencoder"
-    if ce_dir.exists() and (ce_dir / "crossencoder.pt").exists():
-        from src.crossencoder import apply_ce_topn, load_crossencoder
+            gal_ids = []
+            for src in ("s2", "s3"):
+                p = ids_path(Path(cfg.paths.cache_dir), split_name, src)
+                if p.exists():
+                    gal_ids.extend(np.load(p, allow_pickle=True).tolist())
+            gal_map = gallery.set_index("entity_id")
+            gal_aligned = gal_map.loc[[i for i in gal_ids if i in gal_map.index]].reset_index()
+            keep = [i for i, eid in enumerate(gal_ids) if eid in gal_map.index]
+            gal_emb = gal_emb[keep]
+        except Exception as exc:
+            LOG.warning("embeddings unavailable (%s); lexical blocking only", exc)
+            s1_emb = gal_emb = None
+            gal_aligned = gallery
 
-        model_ce = load_crossencoder(cfg, ce_dir)
-        feats = apply_ce_topn(model_ce, feats, s1, gal_aligned, cfg, "p_gbm")
+        idf = load_idf_if_any(cfg)
+        if pairs_p.exists() and not force:
+            LOG.info("RESUME  reuse blocked pairs  %s", pairs_p)
+            pairs = load_parquet(pairs_p)
+            bmetrics = {"resumed": True, "n_pairs": int(len(pairs))}
+        else:
+            cand_map, pairs, bmetrics = run_blocking(
+                cfg, s1, gal_aligned, s1_emb, gal_emb, idf,
+                out_tsv=out_cand, tag=f"{split_name}_{tag}", truth_map=None,
+            )
+            save_parquet(pairs, pairs_p)
+        feats = build_pair_features(
+            pairs, s1, gal_aligned, idf, int(cfg.features.chunk_pairs),
+            checkpoint_dir=cache_dir(cfg), name=split_name,
+            workers=int(getattr(cfg.features, "n_jobs", -1)),
+        )
+        feats = _add_cosines(cfg, feats, s1, gal_aligned, split_name, split_name, tag, tag)
+        score_cols = [c for c in feats.columns if c.startswith("score_") or c.startswith("cosine_")]
+        feats = add_rank_context_features(feats, score_cols)
+
+    already_scored = "p" in feats.columns and scored_p.exists() and not force
+    if already_scored:
+        LOG.info("RESUME  scored table already has p  rows=%s — skip LightGBM/CE", f"{len(feats):,}")
     else:
-        feats["p_ce"] = np.nan
+        lgbm_path = Path(cfg.paths.models_dir) / "lgbm.joblib"
+        if lgbm_path.exists():
+            booster, cols = load_matcher(lgbm_path)
+            for c in cols:
+                if c not in feats.columns:
+                    feats[c] = 0.0
+            feats["p_gbm"] = predict_lgbm(booster, feats, cols)
+        else:
+            feats["p_gbm"] = feats.get("name_rf_token_set", pd.Series(0, index=feats.index)).fillna(0)
 
-    stack_path = Path(cfg.paths.models_dir) / "stacker.joblib"
-    if stack_path.exists() and feats["p_ce"].notna().any():
-        bundle = load_stacker(stack_path)
-        feats["p"] = apply_stacker(bundle, feats)
-    else:
-        feats["p"] = feats["p_gbm"]
+        ce_dir = Path(cfg.paths.models_dir) / "crossencoder"
+        if ce_dir.exists() and (ce_dir / "crossencoder.pt").exists():
+            from src.crossencoder import apply_ce_topn, load_crossencoder
+
+            model_ce = load_crossencoder(cfg, ce_dir)
+            feats = apply_ce_topn(model_ce, feats, s1, gal_aligned, cfg, "p_gbm")
+        else:
+            feats["p_ce"] = np.nan
+
+        stack_path = Path(cfg.paths.models_dir) / "stacker.joblib"
+        if stack_path.exists() and feats["p_ce"].notna().any():
+            bundle = load_stacker(stack_path)
+            feats["p"] = apply_stacker(bundle, feats)
+        else:
+            feats["p"] = feats["p_gbm"]
 
     s1_ids = s1["entity_id"].astype(str).tolist()
     pred = apply_decision(
@@ -507,7 +609,7 @@ def _predict_split(cfg, s1, gallery, split_name: str, out_match: Path, out_cand:
     write_matching_results(s1_ids, pred, out_match)
     LOG.info("wrote %s  and  %s  (rows=%s  predicted links=%s)",
              out_match, out_cand, f"{len(s1_ids):,}", f"{sum(len(v) for v in pred.values()):,}")
-    save_parquet(feats, cache_dir(cfg) / f"{split_name}_scored.parquet")
+    save_parquet(feats, scored_p)
     return {"blocking": bmetrics, "n_s1": len(s1_ids), "n_pred_links": sum(len(v) for v in pred.values())}
 
 
@@ -575,30 +677,22 @@ def stage_predict(cfg):
 
 
 def stage_all(cfg):
-    LOG.info("running full pipeline  eda → … → predict")
-    stage_eda(cfg)
-    stage_split(cfg)
-    stage_normalize(cfg)
-    stage_block(cfg)
-    if cfg.biencoder.enabled and not cfg.debug.fast:
-        try:
-            stage_train_biencoder(cfg)
-        except Exception:
-            LOG.exception("train_biencoder failed — continuing with zero-shot embeddings")
-    stage_features(cfg)
-    stage_train_matcher(cfg)
-    if cfg.cross_encoder.enabled and not cfg.debug.fast:
-        try:
-            stage_train_crossencoder(cfg)
-        except Exception:
-            LOG.exception("train_crossencoder failed — continuing with LightGBM scores only")
-    try:
-        stage_stack(cfg)
-    except Exception:
-        LOG.exception("stacker failed — decision will use p_gbm")
-    stage_decide(cfg)
-    stage_evaluate(cfg)
-    return stage_predict(cfg)
+    LOG.info("full pipeline  resume=%s  force=%s  force_from=%s",
+             getattr(cfg, "_resume", True), getattr(cfg, "_force", False),
+             getattr(cfg, "_force_from", None))
+    print_status(cfg)
+    _run_named(cfg, "eda", stage_eda)
+    _run_named(cfg, "split", stage_split)
+    _run_named(cfg, "normalize", stage_normalize)
+    _run_named(cfg, "block", stage_block)
+    _run_named(cfg, "train_biencoder", stage_train_biencoder, optional=True)
+    _run_named(cfg, "features", stage_features)
+    _run_named(cfg, "train_matcher", stage_train_matcher)
+    _run_named(cfg, "train_crossencoder", stage_train_crossencoder, optional=True)
+    _run_named(cfg, "stack", stage_stack, optional=True)
+    _run_named(cfg, "decide", stage_decide)
+    _run_named(cfg, "evaluate", stage_evaluate)
+    return _run_named(cfg, "predict", stage_predict)
 
 
 DISPATCH = {
@@ -620,23 +714,54 @@ DISPATCH = {
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Business entity resolution pipeline")
-    p.add_argument("--stage", required=True, choices=STAGES)
+    p.add_argument("--stage", default=None, choices=STAGES, help="stage to run (omit with --status)")
     p.add_argument("--config", default="configs/default.yaml")
     p.add_argument("--quiet", action="store_true", help="INFO only (hide DEBUG cache lines)")
+    p.add_argument("--status", action="store_true", help="print checkpoint status and exit")
+    p.add_argument("--force", action="store_true", help="re-run even if artifacts exist")
+    p.add_argument(
+        "--force-from",
+        choices=PIPELINE_STAGES,
+        default=None,
+        help="with --stage all, re-run this stage and everything after it",
+    )
+    p.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="do not skip completed stages (still reuses parquet/npy inside a stage)",
+    )
     args = p.parse_args(argv)
-    setup_logging(verbose=not args.quiet)
     cfg = load_config(args.config)
+    if args.status:
+        setup_logging(verbose=not args.quiet)
+        print_status(cfg)
+        return 0
+    log_path = default_log_path(cfg.paths.reports_dir)
+    setup_logging(verbose=not args.quiet, log_file=log_path)
+    if not args.stage:
+        p.error("--stage is required unless you pass --status")
     set_seeds(int(cfg.seed))
     hw = apply_auto_batch(cfg)
     Path(cfg.paths.output_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.paths.reports_dir).mkdir(parents=True, exist_ok=True)
     Path(cfg.paths.models_dir).mkdir(parents=True, exist_ok=True)
+    Path(cfg.paths.cache_dir).mkdir(parents=True, exist_ok=True)
+    cfg._force = bool(args.force)
+    cfg._force_from = args.force_from
+    cfg._resume = not bool(args.no_resume)
+    cfg._log_file = str(log_path)
     LOG.info("config=%s  seed=%s", cfg._path, cfg.seed)
     LOG.info("backbone=%s  repo=%s  prefix=%r", cfg.backbone.preset, cfg.backbone.repo, cfg.backbone.prefix)
     LOG.info("hardware %s", hw)
+    LOG.info(
+        "resume=%s  force=%s  force_from=%s  log=%s",
+        cfg._resume, cfg._force, cfg._force_from, log_path,
+    )
+    mark_stage(cfg, args.stage, "started", log_file=str(log_path))
     _log(cfg, args.stage, f"start stage={args.stage}", {"hardware": hw, "backbone": as_dict(cfg)["backbone"]})
+    t0 = time.perf_counter()
     DISPATCH[args.stage](cfg)
-    LOG.info("finished --stage %s", args.stage)
+    LOG.info("finished --stage %s  elapsed=%s  log=%s", args.stage, fmt_elapsed(time.perf_counter() - t0), log_path)
     return 0
 
 

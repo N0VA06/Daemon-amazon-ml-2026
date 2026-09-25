@@ -46,10 +46,26 @@ python -m src.evaluate
 
 ## Run
 
-Logs go to stdout (`HH:MM:SS | INFO | …`). Caches under `cache/` are reused.
+Every stage writes artifacts as soon as they exist. Kill the job and re-run
+`--stage all` — finished stages are skipped, in-progress pair-feature chunks
+resume, embeddings and normalized parquets are reused.
+
+Logs go to stdout **and** `reports/logs/run_YYYYMMDD_HHMMSS.log`
+(`reports/logs/latest.log` points at the current file).
+`cache/progress.json` records start / done / fail + elapsed per stage.
 
 ```bash
+# see what is already on disk
+python -m src.run --status --config configs/default.yaml
+
+# continue (default). same command as a first run.
 python -m src.run --stage all --config configs/default.yaml
+
+# rebuild from a stage onward
+python -m src.run --stage all --force-from features
+
+# rebuild everything
+python -m src.run --stage all --force
 ```
 
 Snowflake backbone (same code, prefix `query: `):
@@ -98,5 +114,6 @@ TSVs → normalize → block (FAISS ∪ TF-IDF ∪ keys)
 | --- | --- |
 | `backbone.preset` / `repo` / `prefix` | backbone swap |
 | `blocking.k_cap` | union cap per S1 |
+| `normalize.n_jobs` | process-pool row normalize (`-1` = all CPUs) |
 | `blocking.same_country_only` | group by country string |
 | `decision.rule` | `global` / `relative` / `expected_f05` |

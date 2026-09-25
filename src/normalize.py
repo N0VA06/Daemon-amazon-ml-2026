@@ -9,14 +9,18 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import unicodedata
 from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
 from tqdm.auto import tqdm
+
+from src.logging_utils import LOG
 
 # ---------------------------------------------------------------------------
 # Legal forms (extracted into their own field; stripped from core_name)
@@ -488,14 +492,66 @@ def normalize_row(
     }
 
 
+_WORKER_ABBREV: dict[str, str] | None = None
+
+
+def _init_normalize_worker(extra_abbrev: dict[str, str] | None) -> None:
+    global _WORKER_ABBREV
+    _WORKER_ABBREV = extra_abbrev
+
+
+def _normalize_chunk(payload: tuple[list[str], list[str], list[str]]) -> list[dict]:
+    names, addrs, countries = payload
+    abbrev = _WORKER_ABBREV
+    return [normalize_row(n, a, c, abbrev) for n, a, c in zip(names, addrs, countries)]
+
+
+def _n_jobs(n_jobs: int | None) -> int:
+    cpu = os.cpu_count() or 1
+    if n_jobs is None or int(n_jobs) < 0:
+        return max(1, cpu)
+    return max(1, min(int(n_jobs), cpu))
+
+
 def normalize_frame(
     df: pd.DataFrame,
     extra_abbrev: dict[str, str] | None = None,
+    n_jobs: int | None = None,
+    chunk_size: int = 20000,
 ) -> pd.DataFrame:
-    rows = [
-        normalize_row(r.business_name, r.business_address, r.country, extra_abbrev)
-        for r in tqdm(df.itertuples(index=False), total=len(df), desc="normalize rows", leave=False)
+    """ProcessPool over row chunks — not a single-process itertuples loop."""
+    names = df["business_name"].astype(str).tolist()
+    addrs = df["business_address"].astype(str).tolist()
+    countries = df["country"].astype(str).tolist()
+    n = len(df)
+    jobs = _n_jobs(n_jobs)
+    payloads = [
+        (names[i : i + chunk_size], addrs[i : i + chunk_size], countries[i : i + chunk_size])
+        for i in range(0, n, chunk_size)
     ]
+    if jobs == 1 or len(payloads) == 1:
+        LOG.info("normalize rows  n=%s  workers=1  chunks=%s", f"{n:,}", len(payloads))
+        _init_normalize_worker(extra_abbrev)
+        rows = [_normalize_chunk(p) for p in tqdm(payloads, desc="normalize chunks", leave=False)]
+        rows = [r for chunk in rows for r in chunk]
+    else:
+        LOG.info(
+            "normalize ProcessPool  n=%s  workers=%s  chunks=%s  chunk_size=%s",
+            f"{n:,}", jobs, len(payloads), f"{chunk_size:,}",
+        )
+        rows = []
+        with ProcessPoolExecutor(
+            max_workers=jobs,
+            initializer=_init_normalize_worker,
+            initargs=(extra_abbrev,),
+        ) as pool:
+            for chunk_rows in tqdm(
+                pool.map(_normalize_chunk, payloads, chunksize=1),
+                total=len(payloads),
+                desc="normalize chunks",
+                leave=True,
+            ):
+                rows.extend(chunk_rows)
     extra = pd.DataFrame(rows)
     out = pd.concat([df.reset_index(drop=True), extra], axis=1)
     return out

@@ -142,7 +142,10 @@ def encode_frame_views(
         np.save(id_p, df["entity_id"].astype(str).to_numpy())
     need = [v for v in views if overwrite or not embedding_path(cache, split, source, v, tag).exists()]
     if not need:
-        LOG.info("embedding cache hit  %s/%s tag=%s", split, source, tag)
+        for v in views:
+            p = embedding_path(cache, split, source, v, tag)
+            mb = p.stat().st_size / (1024 * 1024) if p.exists() else 0
+            LOG.info("embedding cache hit  %s/%s/%s tag=%s  %.1f MB", split, source, v, tag, mb)
         return {v: embedding_path(cache, split, source, v, tag) for v in views}
     if model is None:
         model = load_sentence_transformer(cfg)
@@ -154,6 +157,8 @@ def encode_frame_views(
         embs = encode_texts(model, texts, batch_size=batch, normalize=cfg.backbone.normalize)
         p = embedding_path(cache, split, source, view, tag)
         save_embeddings(p, embs)
+        mb = p.stat().st_size / (1024 * 1024)
+        LOG.info("wrote embeddings  %s  shape=%s  %.1f MB  (resume-safe)", p, embs.shape, mb)
         paths[view] = p
     for view in views:
         paths.setdefault(view, embedding_path(cache, split, source, view, tag))

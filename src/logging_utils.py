@@ -1,4 +1,4 @@
-"""Stdout logging for the pipeline, plus a short experiments.md append."""
+"""Stdout + file logging for the pipeline, plus a short experiments.md append."""
 
 from __future__ import annotations
 
@@ -11,21 +11,71 @@ from typing import Any
 
 LOG = logging.getLogger("er")
 
+_FILE_HANDLER_KEY = "er_file"
 
-def setup_logging(verbose: bool = True) -> logging.Logger:
-    """Idempotent. Verbose = DEBUG (row counts, cache hits); always INFO+ on stdout."""
-    if LOG.handlers:
-        LOG.setLevel(logging.DEBUG if verbose else logging.INFO)
-        return LOG
-    LOG.setLevel(logging.DEBUG if verbose else logging.INFO)
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(logging.DEBUG)
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s | %(levelname)-5s | %(message)s", datefmt="%H:%M:%S")
-    )
-    LOG.addHandler(handler)
+
+def _fmt_elapsed(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    mins, sec = divmod(int(seconds), 60)
+    if mins < 60:
+        return f"{mins}m {sec}s"
+    hours, mins = divmod(mins, 60)
+    return f"{hours}h {mins}m {sec}s"
+
+
+def fmt_elapsed(seconds: float) -> str:
+    return _fmt_elapsed(seconds)
+
+
+def setup_logging(verbose: bool = True, log_file: str | Path | None = None) -> logging.Logger:
+    """Idempotent. Always INFO+ on stdout; DEBUG when verbose. File gets DEBUG."""
+    level = logging.DEBUG if verbose else logging.INFO
+    LOG.setLevel(logging.DEBUG)
     LOG.propagate = False
+
+    if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler) for h in LOG.handlers):
+        stream = logging.StreamHandler(sys.stdout)
+        stream.setLevel(logging.DEBUG if verbose else logging.INFO)
+        stream.setFormatter(
+            logging.Formatter("%(asctime)s | %(levelname)-5s | %(message)s", datefmt="%H:%M:%S")
+        )
+        LOG.addHandler(stream)
+    else:
+        for h in LOG.handlers:
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+                h.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+    if log_file is not None:
+        log_file = Path(log_file)
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        already = any(getattr(h, "baseFilename", None) == str(log_file.resolve()) for h in LOG.handlers)
+        if not already:
+            fh = logging.FileHandler(log_file, encoding="utf-8")
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s | %(levelname)-5s | %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+            fh._er_key = _FILE_HANDLER_KEY  # type: ignore[attr-defined]
+            LOG.addHandler(fh)
+            LOG.info("log file  %s", log_file)
+            latest = log_file.parent / "latest.log"
+            try:
+                if latest.exists() or latest.is_symlink():
+                    latest.unlink()
+                latest.symlink_to(log_file.resolve())
+            except OSError:
+                latest.write_text(f"{log_file.resolve()}\n", encoding="utf-8")
     return LOG
+
+
+def default_log_path(reports_dir: str | Path) -> Path:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Path(reports_dir) / "logs" / f"run_{ts}.log"
 
 
 def banner(stage: str, index: int | None = None, total: int | None = None) -> None:
@@ -63,7 +113,9 @@ def log_experiment(path: str | Path, stage: str, message: str, metrics: dict | N
 def write_json(path: str | Path, obj: Any) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2, default=str) + "\n", encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, default=str) + "\n", encoding="utf-8")
+    tmp.replace(path)
     LOG.debug("wrote %s", path)
 
 

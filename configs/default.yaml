@@ -1,6 +1,10 @@
 # Business Entity Resolution — default config
 # Swap the backbone with one key: set backbone.preset to "snowflake"
 # or override backbone.repo / backbone.prefix.
+#
+# Resume: every parquet / npy / model is kept on disk. Re-run
+#   python -m src.run --stage all
+# to continue. --status lists what is already done. Logs: reports/logs/.
 
 seed: 42
 team_name: team_jina_er
@@ -29,7 +33,7 @@ backbone:
   trust_remote_code: true
   # Matryoshka truncation for fast blocking (optional)
   matryoshka_dims: [1024, 512, 256]
-  encode_views: [combined, name, address]
+  encode_views: [combined]              # name/address views are extra encode hours; add them back for ablations
   record_template: "{name} | {address} | {country}"
 
 # Tested drop-in (Apache-2.0). Copy these three keys or use --config configs/snowflake.yaml
@@ -52,13 +56,15 @@ normalize:
   compute_idf: true            # IDF over ALL source files (train+test) when true
   mine_abbreviations: true     # aligned-token substitutions from matched train pairs
   min_abbrev_count: 8
+  n_jobs: -1                   # process-pool normalize; each source parquet is resume-safe
+  max_abbrev_pairs: 250000     # sample matched pairs for abbrev mining
 
 blocking:
   same_country_only: true      # matches in train share country; France still works
-  k_faiss: 50
-  k_tfidf: 30
-  k_key: 20
-  k_cap: 80                    # union, then cap per S1
+  k_faiss: 30
+  k_tfidf: 20
+  k_key: 15
+  k_cap: 40                    # union, then cap per S1 (was 80; 1-day profile)
   tfidf_analyzer: char
   tfidf_ngram_min: 2
   tfidf_ngram_max: 4
@@ -76,6 +82,7 @@ features:
   compute_zero_shot_cosine: true
   compute_finetuned_cosine: true
   chunk_pairs: 250000          # 124 GB RAM; smaller is only needed on tight machines
+  n_jobs: -1                   # RapidFuzz cpdist workers (-1 = all CPUs)
 
 matcher:
   objective: binary
@@ -120,10 +127,12 @@ biencoder:
   lr: 1.0e-4                   # 2e-5 if full_finetune
   full_finetune_lr: 2.0e-5
   warmup_ratio: 0.10
-  phase_a_epochs: 2
+  phase_a_epochs: 1
   phase_b_epochs: 1
   hard_negatives_per_anchor: 2
-  max_train_pairs: 800000      # L4 + 124 GB; drop to 400000 for a faster first pass
+  max_train_pairs: 200000      # 1-day profile; raise toward 800000 if you have more time
+  mine_gallery_size: 400000    # encode this many S2/S3 for hard-neg mine, not all
+  eval_gallery_size: 50000     # retrieval eval cap (truth matches always kept)
   max_hard_neg_pool: 80
   use_matryoshka: true
   use_entity_aware_sampler: true
@@ -135,7 +144,7 @@ biencoder:
   eval_ks: [1, 10, 50]
 
 cross_encoder:
-  enabled: true
+  enabled: false               # 1-day profile; LightGBM + stacker is the matcher
   top_n: 10
   max_length: 256
   lora_r: 16

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -66,64 +67,201 @@ def norm_path(cfg, split: str, source: str) -> Path:
     return cache_dir(cfg) / "normalized" / f"{split}_{source}.parquet"
 
 
-def load_or_build_normalized(cfg, df: pd.DataFrame, split: str, source: str, extra_abbrev=None):
-    path = norm_path(cfg, split, source)
-    if path.exists():
-        LOG.info("cache hit  %s  (%s rows)", path, f"{len(df):,}")
-        return pd.read_parquet(path)
-    LOG.info("normalizing %s/%s  n=%s  → %s", split, source, f"{len(df):,}", path)
-    out = normalize_frame(df, extra_abbrev)
-    out = attach_record_texts(out, cfg.backbone.prefix, cfg.backbone.record_template)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    out.to_parquet(path, index=False)
-    LOG.info("wrote %s", path)
+def parquet_nrows(path: Path) -> int:
+    try:
+        import pyarrow.parquet as pq
+
+        return int(pq.read_metadata(path).num_rows)
+    except Exception:
+        return -1
+
+
+def normalized_sources() -> tuple[tuple[str, str], ...]:
+    return (
+        ("train", "s1"),
+        ("train", "s2"),
+        ("train", "s3"),
+        ("test", "s1"),
+        ("test", "s2"),
+        ("test", "s3"),
+    )
+
+
+def all_normalized_cached(cfg) -> bool:
+    for split, source in normalized_sources():
+        if not norm_path(cfg, split, source).exists():
+            return False
+    if bool(getattr(cfg.normalize, "compute_idf", True)):
+        if not (cache_dir(cfg) / "idf.json").exists():
+            return False
+    return True
+
+
+def cached_normalized_counts(cfg) -> dict[str, int]:
+    out = {}
+    for split, source in normalized_sources():
+        p = norm_path(cfg, split, source)
+        out[f"{split}_{source}"] = parquet_nrows(p) if p.exists() else 0
+    out["idf"] = int((cache_dir(cfg) / "idf.json").exists())
     return out
 
 
-def build_all_normalized(cfg) -> dict:
-    s1, s2, s3, gt = load_train(cfg)
-    t1, t2, t3 = load_test(cfg)
-    extra = {}
-    if cfg.normalize.mine_abbreviations:
-        # align S1 name/addr with first match
-        s_all = pd.concat([s1, s2, s3], ignore_index=True).set_index("entity_id")
-        left_n, right_n, left_a, right_a = [], [], [], []
-        for row in gt.itertuples(index=False):
-            if not row.matched_list or row.source1_entity_id not in s_all.index:
-                continue
-            mid = row.matched_list[0]
-            if mid not in s_all.index:
-                continue
-            left_n.append(s_all.loc[row.source1_entity_id].business_name)
-            right_n.append(s_all.loc[mid].business_name)
-            left_a.append(s_all.loc[row.source1_entity_id].business_address)
-            right_a.append(s_all.loc[mid].business_address)
-        extra.update(mine_abbreviations(left_n, right_n, int(cfg.normalize.min_abbrev_count)))
-        extra.update(mine_abbreviations(left_a, right_a, int(cfg.normalize.min_abbrev_count)))
-        LOG.info("mined %s abbreviation substitutions from matched train pairs", len(extra))
-        (cache_dir(cfg) / "mined_abbrev.json").write_text(
-            __import__("json").dumps(extra, indent=2), encoding="utf-8"
-        )
+def load_or_build_normalized(cfg, df: pd.DataFrame, split: str, source: str, extra_abbrev=None):
+    path = norm_path(cfg, split, source)
+    if path.exists():
+        n = parquet_nrows(path)
+        LOG.info("cache hit  %s  (%s rows on disk, skip normalize)", path, f"{n:,}" if n >= 0 else "?")
+        return pd.read_parquet(path)
+    n_jobs = int(getattr(cfg.normalize, "n_jobs", -1))
+    LOG.info(
+        "normalizing %s/%s  n=%s  n_jobs=%s  → %s",
+        split, source, f"{len(df):,}", n_jobs, path,
+    )
+    out = normalize_frame(df, extra_abbrev, n_jobs=n_jobs)
+    out = attach_record_texts(out, cfg.backbone.prefix, cfg.backbone.record_template)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(path, index=False)
+    mb = path.stat().st_size / (1024 * 1024)
+    LOG.info("wrote %s  rows=%s  %.1f MB  (resume-safe)", path, f"{len(out):,}", mb)
+    return out
 
-    frames = {
-        "train_s1": load_or_build_normalized(cfg, s1, "train", "s1", extra),
-        "train_s2": load_or_build_normalized(cfg, s2, "train", "s2", extra),
-        "train_s3": load_or_build_normalized(cfg, s3, "train", "s3", extra),
-        "test_s1": load_or_build_normalized(cfg, t1, "test", "s1", extra),
-        "test_s2": load_or_build_normalized(cfg, t2, "test", "s2", extra),
-        "test_s3": load_or_build_normalized(cfg, t3, "test", "s3", extra),
+
+def _load_or_mine_abbrev(cfg, s1, s2, s3, gt) -> dict:
+    path = cache_dir(cfg) / "mined_abbrev.json"
+    if path.exists():
+        extra = json.loads(path.read_text(encoding="utf-8"))
+        LOG.info("cache hit  mined abbreviations  %s  (%s entries)", path, len(extra))
+        return extra
+    if not cfg.normalize.mine_abbreviations:
+        return {}
+    LOG.info("mining abbreviations from matched train pairs (join, not row-loc)")
+    s_all = pd.concat(
+        [
+            s1[["entity_id", "business_name", "business_address"]],
+            s2[["entity_id", "business_name", "business_address"]],
+            s3[["entity_id", "business_name", "business_address"]],
+        ],
+        ignore_index=True,
+    ).drop_duplicates("entity_id")
+    pairs = gt.copy()
+    pairs["matched_id"] = pairs["matched_list"].map(lambda xs: xs[0] if xs else "")
+    pairs = pairs[pairs["matched_id"].astype(str) != ""]
+    cap = int(getattr(cfg.normalize, "max_abbrev_pairs", 0) or 0)
+    if cap and len(pairs) > cap:
+        pairs = pairs.sample(n=cap, random_state=int(cfg.seed))
+        LOG.info("abbrev mine sampled to %s pairs (normalize.max_abbrev_pairs)", f"{cap:,}")
+    left = pairs.merge(s_all, left_on="source1_entity_id", right_on="entity_id", how="inner")
+    right = s_all.rename(
+        columns={
+            "entity_id": "matched_id",
+            "business_name": "r_name",
+            "business_address": "r_addr",
+        }
+    )
+    aligned = left.merge(right, on="matched_id", how="inner")
+    LOG.info("abbrev-aligned pairs=%s", f"{len(aligned):,}")
+    extra = {}
+    extra.update(
+        mine_abbreviations(
+            aligned["business_name"].tolist(),
+            aligned["r_name"].tolist(),
+            int(cfg.normalize.min_abbrev_count),
+        )
+    )
+    extra.update(
+        mine_abbreviations(
+            aligned["business_address"].tolist(),
+            aligned["r_addr"].tolist(),
+            int(cfg.normalize.min_abbrev_count),
+        )
+    )
+    path.write_text(json.dumps(extra, indent=2), encoding="utf-8")
+    LOG.info("mined %s abbreviation substitutions → %s", len(extra), path)
+    return extra
+
+
+def build_all_normalized(cfg) -> dict:
+    """Build or reuse cache/normalized/*.parquet. Each source is written as soon
+    as it finishes, so a killed job continues from the next missing file.
+    """
+    if all_normalized_cached(cfg):
+        counts = cached_normalized_counts(cfg)
+        LOG.info("normalize cache complete — not re-reading TSVs")
+        for k, n in counts.items():
+            if k != "idf":
+                LOG.info("  %s  %s rows", k, f"{n:,}" if n >= 0 else "?")
+        return counts
+
+    pending = [(sp, src) for sp, src in normalized_sources() if not norm_path(cfg, sp, src).exists()]
+    need_train = any(sp == "train" for sp, _ in pending) or (
+        bool(cfg.normalize.mine_abbreviations)
+        and not (cache_dir(cfg) / "mined_abbrev.json").exists()
+    )
+    need_test = any(sp == "test" for sp, _ in pending)
+    s1 = s2 = s3 = gt = t1 = t2 = t3 = None
+    if need_train:
+        s1, s2, s3, gt = load_train(cfg)
+    if need_test:
+        t1, t2, t3 = load_test(cfg)
+    extra = {}
+    if need_train and s1 is not None:
+        extra = _load_or_mine_abbrev(cfg, s1, s2, s3, gt)
+    elif (cache_dir(cfg) / "mined_abbrev.json").exists():
+        extra = json.loads((cache_dir(cfg) / "mined_abbrev.json").read_text(encoding="utf-8"))
+
+    raw = {
+        ("train", "s1"): s1,
+        ("train", "s2"): s2,
+        ("train", "s3"): s3,
+        ("test", "s1"): t1,
+        ("test", "s2"): t2,
+        ("test", "s3"): t3,
     }
+    frames = {}
+    LOG.info(
+        "normalize plan  cached=%s  pending=%s  %s",
+        6 - len(pending),
+        len(pending),
+        [f"{a}_{b}" for a, b in pending] or "none",
+    )
+    idf_path = cache_dir(cfg) / "idf.json"
+    idf_ok = idf_path.exists() or not bool(cfg.normalize.compute_idf)
+    for split, source in normalized_sources():
+        key = f"{split}_{source}"
+        path = norm_path(cfg, split, source)
+        if path.exists() and idf_ok:
+            n = parquet_nrows(path)
+            LOG.info("cache hit  %s  (%s rows on disk, skip load)", path, f"{n:,}" if n >= 0 else "?")
+            frames[key] = None
+        else:
+            df_raw = raw[(split, source)]
+            if df_raw is None:
+                # needed for IDF or missing parquet — load that split now
+                if split == "train":
+                    s1, s2, s3, gt = load_train(cfg)
+                    raw[("train", "s1")], raw[("train", "s2")], raw[("train", "s3")] = s1, s2, s3
+                    df_raw = raw[(split, source)]
+                else:
+                    t1, t2, t3 = load_test(cfg)
+                    raw[("test", "s1")], raw[("test", "s2")], raw[("test", "s3")] = t1, t2, t3
+                    df_raw = raw[(split, source)]
+            frames[key] = load_or_build_normalized(cfg, df_raw, split, source, extra)
+
     if cfg.normalize.compute_idf:
-        idf_path = cache_dir(cfg) / "idf.json"
-        if not idf_path.exists():
+        if idf_path.exists():
+            LOG.info("cache hit  IDF  %s", idf_path)
+        else:
+            LOG.info("computing IDF over train+test token fields (unlabeled X only)")
             token_lists = []
             for df in frames.values():
+                if df is None:
+                    continue
                 token_lists.extend(df["core_tokens"].astype(str).map(str.split).tolist())
                 token_lists.extend(df["addr_tokens"].astype(str).map(str.split).tolist())
             idf = compute_idf(token_lists)
             save_idf(idf, idf_path)
             LOG.info("IDF vocab size %s → %s", f"{len(idf):,}", idf_path)
-    return frames
+    return {k: (v if v is not None else parquet_nrows(norm_path(cfg, *k.split("_", 1)))) for k, v in frames.items()}
 
 
 def load_idf_if_any(cfg) -> dict | None:

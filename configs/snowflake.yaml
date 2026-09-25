@@ -23,7 +23,7 @@ backbone:
   dtype: bfloat16
   trust_remote_code: false
   matryoshka_dims: [1024, 512, 256]
-  encode_views: [combined, name, address]
+  encode_views: [combined]
   record_template: "{name} | {address} | {country}"
 
 split:
@@ -40,13 +40,15 @@ normalize:
   compute_idf: true
   mine_abbreviations: true
   min_abbrev_count: 8
+  n_jobs: -1
+  max_abbrev_pairs: 250000
 
 blocking:
   same_country_only: true
-  k_faiss: 50
-  k_tfidf: 30
-  k_key: 20
-  k_cap: 80
+  k_faiss: 30
+  k_tfidf: 20
+  k_key: 15
+  k_cap: 40
   tfidf_analyzer: char
   tfidf_ngram_min: 2
   tfidf_ngram_max: 4
@@ -64,6 +66,7 @@ features:
   compute_zero_shot_cosine: true
   compute_finetuned_cosine: true
   chunk_pairs: 100000
+  n_jobs: -1
 
 matcher:
   objective: binary
@@ -99,10 +102,12 @@ biencoder:
   lr: 1.0e-4
   full_finetune_lr: 2.0e-5
   warmup_ratio: 0.10
-  phase_a_epochs: 2
+  phase_a_epochs: 1
   phase_b_epochs: 1
   hard_negatives_per_anchor: 2
-  max_train_pairs: 400000
+  max_train_pairs: 200000
+  mine_gallery_size: 400000
+  eval_gallery_size: 50000
   max_hard_neg_pool: 80
   use_matryoshka: true
   use_entity_aware_sampler: true
@@ -114,7 +119,7 @@ biencoder:
   eval_ks: [1, 10, 50]
 
 cross_encoder:
-  enabled: true
+  enabled: false
   top_n: 10
   max_length: 256
   lora_r: 16

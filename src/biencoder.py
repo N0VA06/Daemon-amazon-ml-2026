@@ -122,6 +122,37 @@ def build_positive_pairs(
     return df.reset_index(drop=True)
 
 
+def select_mine_gallery(
+    gallery: pd.DataFrame,
+    pairs: pd.DataFrame,
+    max_n: int,
+    seed: int,
+) -> pd.DataFrame:
+    """Positives that appear in train pairs, plus a random slice. Never the full S2/S3."""
+    needed = set(pairs["positive_id"].astype(str)) | set(pairs["anchor_id"].astype(str))
+    gal_ids = gallery["entity_id"].astype(str)
+    must = gallery.loc[gal_ids.isin(needed)]
+    rest = gallery.loc[~gal_ids.isin(needed)]
+    extra_n = max(0, int(max_n) - len(must))
+    if extra_n and len(rest) > extra_n:
+        rest = rest.sample(n=extra_n, random_state=seed)
+    elif extra_n <= 0:
+        rest = rest.iloc[0:0]
+    out = pd.concat([must, rest], ignore_index=True).drop_duplicates("entity_id")
+    LOG.info(
+        "hard-neg mine gallery %s  (must=%s extra=%s; full S2/S3 was %s — not encoded)",
+        f"{len(out):,}", f"{len(must):,}", f"{len(out) - len(must):,}", f"{len(gallery):,}",
+    )
+    return out.reset_index(drop=True)
+
+
+def select_mine_s1(s1: pd.DataFrame, pairs: pd.DataFrame) -> pd.DataFrame:
+    ids = set(pairs["anchor_id"].astype(str)) | set(pairs["entity_id"].astype(str))
+    out = s1[s1["entity_id"].astype(str).isin(ids)].reset_index(drop=True)
+    LOG.info("hard-neg mine S1 %s / %s (pair anchors only)", f"{len(out):,}", f"{len(s1):,}")
+    return out
+
+
 def mine_hard_negatives(
     pairs: pd.DataFrame,
     s1: pd.DataFrame,
@@ -277,15 +308,32 @@ def _device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def _cap_eval_gallery(s1: pd.DataFrame, gallery: pd.DataFrame, truth_map, max_n: int, seed: int) -> pd.DataFrame:
+    if max_n <= 0 or len(gallery) <= max_n:
+        return gallery
+    must: set[str] = set()
+    for sid in s1["entity_id"].astype(str):
+        must |= set(truth_map.get(sid, set()))
+    gal_ids = gallery["entity_id"].astype(str)
+    keep = gallery.loc[gal_ids.isin(must)]
+    rest = gallery.loc[~gal_ids.isin(must)]
+    extra = max(0, max_n - len(keep))
+    if extra and len(rest) > extra:
+        rest = rest.sample(n=extra, random_state=seed)
+    out = pd.concat([keep, rest], ignore_index=True).drop_duplicates("entity_id")
+    LOG.info("eval gallery capped %s → %s (truth matches kept)", f"{len(gallery):,}", f"{len(out):,}")
+    return out
+
+
 def _eval_retrieval(st_model, s1: pd.DataFrame, gallery: pd.DataFrame, truth_map, cfg, ks) -> dict:
     batch = int(cfg.hardware.encode_batch_size)
-    q = encode_texts(st_model, s1["text_combined"].tolist(), batch, True, False)
-    g = encode_texts(st_model, gallery["text_combined"].tolist(), batch, True, False)
-    # cap eval size
     if len(s1) > 4000:
         idx = np.linspace(0, len(s1) - 1, 4000).astype(int)
         s1 = s1.iloc[idx]
-        q = q[idx]
+    cap = int(getattr(cfg.biencoder, "eval_gallery_size", 50000) or 50000)
+    gallery = _cap_eval_gallery(s1, gallery, truth_map, cap, int(cfg.seed))
+    q = encode_texts(st_model, s1["text_combined"].tolist(), batch, True, False)
+    g = encode_texts(st_model, gallery["text_combined"].tolist(), batch, True, False)
     scores = q @ g.T
     gal_ids = gallery["entity_id"].astype(str).to_numpy()
     ranked = {}
@@ -312,26 +360,39 @@ def train_biencoder(
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     device = _device()
-    st_model = load_sentence_transformer(cfg, use_cache=False)
-    st_model = attach_lora(st_model, cfg)
-    st_model.to(device)
-    st_model.train()
-
-    rec = pd.concat(
-        [
-            s1[["entity_id", "name_exp", "address_exp", "country_raw", "text_combined"]],
-            gallery[["entity_id", "name_exp", "address_exp", "country_raw", "text_combined"]],
-        ],
-        ignore_index=True,
-    ).drop_duplicates("entity_id").set_index("entity_id")
-
     pairs = build_positive_pairs(
         s1, gallery, gt, cfg.backbone.prefix, cfg.backbone.record_template,
         int(cfg.biencoder.max_train_pairs), int(cfg.seed),
     )
-    LOG.info("biencoder  device=%s  positive pairs=%s  gallery=%s", device, f"{len(pairs):,}", f"{len(gallery):,}")
+    mine_n = int(getattr(cfg.biencoder, "mine_gallery_size", 400000) or 400000)
+    mine_gal = select_mine_gallery(gallery, pairs, mine_n, int(cfg.seed))
+    mine_s1 = select_mine_s1(s1, pairs)
+    rec = pd.concat(
+        [
+            s1[["entity_id", "name_exp", "address_exp", "country_raw", "text_combined"]],
+            mine_gal[["entity_id", "name_exp", "address_exp", "country_raw", "text_combined"]],
+        ],
+        ignore_index=True,
+    ).drop_duplicates("entity_id").set_index("entity_id")
+
+    st_model = load_sentence_transformer(cfg, use_cache=False)
+    LOG.info("biencoder  device=%s  positive pairs=%s  mine_gallery=%s  (full gallery texts=%s, not encoded)",
+             device, f"{len(pairs):,}", f"{len(mine_gal):,}", f"{len(gallery):,}")
+    if zs_s1 is None or zs_gal is None:
+        LOG.info("encoding hard-neg mine subset only — not full S2/S3")
+        zs_s1 = encode_texts(
+            st_model, mine_s1["text_combined"].tolist(),
+            int(cfg.hardware.encode_batch_size), True, True,
+        )
+        zs_gal = encode_texts(
+            st_model, mine_gal["text_combined"].tolist(),
+            int(cfg.hardware.encode_batch_size), True, True,
+        )
+    st_model = attach_lora(st_model, cfg)
+    st_model.to(device)
+    st_model.train()
     hard = mine_hard_negatives(
-        pairs, s1, gallery, zs_s1, zs_gal, truth_map,
+        pairs, mine_s1, mine_gal, zs_s1, zs_gal, truth_map,
         k=int(cfg.biencoder.max_hard_neg_pool),
         per_anchor=int(cfg.biencoder.hard_negatives_per_anchor),
         seed=int(cfg.seed),
@@ -363,18 +424,20 @@ def train_biencoder(
     def run_phase(epochs: int, remine: bool, aux: str | None, tag: str) -> list[dict]:
         nonlocal hard, ds
         if remine:
+            LOG.info("phase-B remine: encode mine subset only (S1=%s gallery=%s), not full S2/S3",
+                     f"{len(mine_s1):,}", f"{len(mine_gal):,}")
             st_model.eval()
             with torch.no_grad():
                 s1_e = encode_texts(
-                    st_model, s1["text_combined"].tolist(),
+                    st_model, mine_s1["text_combined"].tolist(),
                     int(cfg.hardware.encode_batch_size), True, True,
                 )
                 g_e = encode_texts(
-                    st_model, gallery["text_combined"].tolist(),
+                    st_model, mine_gal["text_combined"].tolist(),
                     int(cfg.hardware.encode_batch_size), True, True,
                 )
             hard = mine_hard_negatives(
-                pairs, s1, gallery, s1_e, g_e, truth_map,
+                pairs, mine_s1, mine_gal, s1_e, g_e, truth_map,
                 k=int(cfg.biencoder.max_hard_neg_pool),
                 per_anchor=int(cfg.biencoder.hard_negatives_per_anchor),
                 seed=int(cfg.seed) + 7,

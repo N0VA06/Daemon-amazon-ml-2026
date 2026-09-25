@@ -24,5 +24,7 @@ __pycache__/
 *.joblib
 *.pt
 *.png
+reports/logs/
+reports/logs/
 
 .DS_Store

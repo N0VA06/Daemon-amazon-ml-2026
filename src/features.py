@@ -215,14 +215,22 @@ def add_rank_context_features(pairs: pd.DataFrame, score_cols: list[str]) -> pd.
         best = df.groupby("s1_id")[col].transform("max")
         df[f"{col}_gap_to_best"] = best - df[col]
         df[f"{col}_rank"] = df.groupby("s1_id")[col].rank(ascending=False, method="first")
-    # mutual-best: this S1 is the candidate's best S1 under the first available score
-    primary = next((c for c in score_cols if c in df.columns), None)
+    # dense cosine first — score_faiss is NaN for TF-IDF/key-only hits; idxmax on
+    # an all-NaN group returns NaN and df.loc[NaN] raises KeyError
+    primary = next(
+        (c for c in ("cosine_ft_combined", "cosine_zs_combined") if c in df.columns),
+        next((c for c in score_cols if c in df.columns), None),
+    )
     if primary is not None:
-        best_s1_for_cand = df.loc[df.groupby("cand_id")[primary].idxmax(), ["s1_id", "cand_id"]]
-        best_s1_for_cand = best_s1_for_cand.rename(columns={"s1_id": "_best_s1"})
+        idx = df.groupby("cand_id")[primary].idxmax().dropna().astype(np.int64)
+        best_s1_for_cand = (
+            df.loc[idx, ["s1_id", "cand_id"]].rename(columns={"s1_id": "_best_s1"})
+            if len(idx)
+            else pd.DataFrame(columns=["_best_s1", "cand_id"])
+        )
         df = df.merge(best_s1_for_cand, on="cand_id", how="left")
         df["mutual_best"] = (df["s1_id"] == df["_best_s1"]).astype(np.int8)
-        df = df.drop(columns=["_best_s1"])
+        df = df.drop(columns=["_best_s1"], errors="ignore")
         # margin of this candidate to its second-best S1
         def _margin(g: pd.DataFrame) -> pd.Series:
             scores = g[primary].to_numpy()

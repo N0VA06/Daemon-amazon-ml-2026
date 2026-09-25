@@ -119,22 +119,22 @@ biencoder:
     - o_proj
   temperature: 0.05            # τ; scale = 1/τ = 20
   scale: 20
-  effective_batch_size: 1024
-  mini_batch_size: 64
+  effective_batch_size: 128    # L4 22GB OOM at 1024; InfoNCE graph stays this wide
+  mini_batch_size: 16
   lr: 1.0e-4                   # 2e-5 if full_finetune
   full_finetune_lr: 2.0e-5
   warmup_ratio: 0.06
   phase_a_epochs: 1            # one InfoNCE pass
   phase_b_epochs: 0            # skip remine/CoSENT
   hard_negatives_per_anchor: 1
-  max_train_pairs: 40000       # ~40 GPU steps at batch 1024
+  max_train_pairs: 40000       # ~312 GPU steps at batch 128
   mine_gallery_size: 40000     # encode this many S2/S3 for hard-neg mine only
   eval_gallery_size: 0         # 0 = skip mid-train retrieval eval
   max_hard_neg_pool: 20
   use_matryoshka: true
   use_entity_aware_sampler: true
   no_duplicates: true
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   phase_b_aux_loss: cosent     # cosent | online_contrastive
   online_contrastive_margin: 0.5
   cosent_lambda: 20.0

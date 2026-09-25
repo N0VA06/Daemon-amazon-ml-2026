@@ -98,8 +98,8 @@ biencoder:
   target_modules: [q_proj, k_proj, v_proj, o_proj]
   temperature: 0.05
   scale: 20
-  effective_batch_size: 1024
-  mini_batch_size: 64
+  effective_batch_size: 128
+  mini_batch_size: 16
   lr: 1.0e-4
   full_finetune_lr: 2.0e-5
   warmup_ratio: 0.06
@@ -113,7 +113,7 @@ biencoder:
   use_matryoshka: true
   use_entity_aware_sampler: true
   no_duplicates: true
-  gradient_checkpointing: false
+  gradient_checkpointing: true
   phase_b_aux_loss: cosent
   online_contrastive_margin: 0.5
   cosent_lambda: 20.0

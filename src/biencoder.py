@@ -393,6 +393,10 @@ def train_biencoder(
             st_model, mine_gal["text_combined"].tolist(),
             int(cfg.hardware.encode_batch_size), True, True,
         )
+        if device.type == "cuda":
+            import torch
+
+            torch.cuda.empty_cache()
     st_model = attach_lora(st_model, cfg)
     st_model.to(device)
     st_model.train()

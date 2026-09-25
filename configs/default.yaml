@@ -2,9 +2,9 @@
 # Swap the backbone with one key: set backbone.preset to "snowflake"
 # or override backbone.repo / backbone.prefix.
 #
-# Resume: every parquet / npy / model is kept on disk. Re-run
-#   python -m src.run --stage all
-# to continue. --status lists what is already done. Logs: reports/logs/.
+# 12-hour profile (L4 24 GB + ~124 GB RAM): zs embeddings + LightGBM,
+# no LoRA / CE. Re-run `python -m src.run --stage all` to resume.
+# --status lists what is already done. Logs: reports/logs/.
 
 seed: 42
 team_name: team_jina_er
@@ -26,7 +26,7 @@ backbone:
   # jina (text-matching LoRA merged into Qwen3-0.6B, 1024-d, last-token pool)
   repo: jinaai/jina-embeddings-v5-text-small-text-matching
   prefix: "Document: "         # same prefix on BOTH sides, train + inference
-  max_seq_length: 128
+  max_seq_length: 64           # 12h: ~2× faster encode than 128
   dim: 1024
   normalize: true
   dtype: bfloat16              # model_kwargs={"dtype": torch.bfloat16}
@@ -42,11 +42,11 @@ backbone:
 # backbone.prefix: "query: "
 
 split:
-  val_frac: 0.20
-  n_folds: 3
+  val_frac: 0.10               # 12h: half the val encode / pair work
+  n_folds: 2
   stratify_cols: [country, is_singleton]
   # Unlinked S2/S3 share added to the val gallery so train:test size ratios match
-  gallery_unlinked_frac: 0.20
+  gallery_unlinked_frac: 0.08
 
 normalize:
   nfkc: true
@@ -57,44 +57,45 @@ normalize:
   mine_abbreviations: true     # aligned-token substitutions from matched train pairs
   min_abbrev_count: 8
   n_jobs: -1                   # process-pool normalize; each source parquet is resume-safe
-  max_abbrev_pairs: 250000     # sample matched pairs for abbrev mining
+  max_abbrev_pairs: 80000
+  max_idf_docs: 1500000        # sample IDF docs; unlabeled X only
 
 blocking:
   same_country_only: true      # matches in train share country; France still works
-  k_faiss: 30
-  k_tfidf: 20
-  k_key: 15
-  k_cap: 40                    # union, then cap per S1 (was 80; 1-day profile)
+  k_faiss: 15
+  k_tfidf: 12
+  k_key: 8
+  k_cap: 20                    # 12h: ~35M test pairs instead of 70M+
   tfidf_analyzer: char
   tfidf_ngram_min: 2
   tfidf_ngram_max: 4
-  tfidf_max_features: 200000
+  tfidf_max_features: 80000
   tfidf_min_df: 3
-  tfidf_svd_dim: 256           # sparse TF-IDF → SVD → FAISS
+  tfidf_svd_dim: 128
   rare_token_idf_quantile: 0.70
   faiss_index: ivf             # flat | ivf | hnsw
-  faiss_nlist: 8192            # ~4*sqrt(N) for a 5–10M gallery; 124 GB RAM is enough
-  faiss_nprobe: 48
+  faiss_nlist: 4096
+  faiss_nprobe: 16
   faiss_use_zero_shot: true    # Stage 3 baseline
-  faiss_use_finetuned: true    # Stage 4+
+  faiss_use_finetuned: false   # no LoRA in the 12h profile
 
 features:
   compute_zero_shot_cosine: true
-  compute_finetuned_cosine: true
+  compute_finetuned_cosine: false
   chunk_pairs: 250000          # 124 GB RAM; smaller is only needed on tight machines
   n_jobs: -1                   # RapidFuzz cpdist workers (-1 = all CPUs)
 
 matcher:
   objective: binary
   metric: binary_logloss
-  n_estimators: 800
-  learning_rate: 0.05
-  num_leaves: 63
+  n_estimators: 300
+  learning_rate: 0.08
+  num_leaves: 47
   min_child_samples: 50
   subsample: 0.8
   colsample_bytree: 0.8
-  early_stopping_rounds: 50
-  negative_sample_ratio: 8     # keep all hard negatives
+  early_stopping_rounds: 30
+  negative_sample_ratio: 4
   n_jobs: -1
   # LightGBM monotone: 1 increasing, -1 decreasing
   # applied to named columns below
@@ -107,7 +108,7 @@ matcher:
     cosine_combined: 1
 
 biencoder:
-  enabled: true
+  enabled: false               # 12h: skip LoRA train + remine + second encode pass
   full_finetune: false         # ablation only; default is LoRA
   lora_r: 32
   lora_alpha: 64
@@ -122,17 +123,17 @@ biencoder:
     - down_proj
   temperature: 0.05            # τ; scale = 1/τ = 20
   scale: 20
-  effective_batch_size: 1024   # auto_batch sets 1024 on L4-class (20–24 GB)
-  mini_batch_size: 64          # auto_batch overwrites from VRAM
+  effective_batch_size: 1024
+  mini_batch_size: 64
   lr: 1.0e-4                   # 2e-5 if full_finetune
   full_finetune_lr: 2.0e-5
   warmup_ratio: 0.10
   phase_a_epochs: 1
-  phase_b_epochs: 1
+  phase_b_epochs: 0
   hard_negatives_per_anchor: 2
-  max_train_pairs: 200000      # 1-day profile; raise toward 800000 if you have more time
-  mine_gallery_size: 400000    # encode this many S2/S3 for hard-neg mine, not all
-  eval_gallery_size: 50000     # retrieval eval cap (truth matches always kept)
+  max_train_pairs: 60000
+  mine_gallery_size: 80000
+  eval_gallery_size: 20000
   max_hard_neg_pool: 80
   use_matryoshka: true
   use_entity_aware_sampler: true
@@ -169,11 +170,11 @@ decision:
   global_threshold: 0.55
   relative_alpha: 0.85
   one_to_one: true
-  compare_all_rules: true      # Stage 6 ablation on OOF / hold-out
+  compare_all_rules: false
 
 hardware:
-  auto_batch: true             # L4 24 GB → encode 256, mini 64, InfoNCE 1024, CE 16
-  encode_batch_size: 256       # overwritten by GPU detect when auto_batch
+  auto_batch: false            # sizes below are used as-is
+  encode_batch_size: 512
   faiss_gpu: false             # CPU FAISS; 124 GB RAM holds 10M×1024-d indexes
 
 debug:

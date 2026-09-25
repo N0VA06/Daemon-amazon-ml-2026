@@ -17,7 +17,7 @@ backbone:
   preset: snowflake
   repo: Snowflake/snowflake-arctic-embed-l-v2.0
   prefix: "query: "
-  max_seq_length: 128
+  max_seq_length: 64
   dim: 1024
   normalize: true
   dtype: bfloat16
@@ -27,10 +27,10 @@ backbone:
   record_template: "{name} | {address} | {country}"
 
 split:
-  val_frac: 0.20
-  n_folds: 3
+  val_frac: 0.10
+  n_folds: 2
   stratify_cols: [country, is_singleton]
-  gallery_unlinked_frac: 0.20
+  gallery_unlinked_frac: 0.08
 
 normalize:
   nfkc: true
@@ -41,44 +41,45 @@ normalize:
   mine_abbreviations: true
   min_abbrev_count: 8
   n_jobs: -1
-  max_abbrev_pairs: 250000
+  max_abbrev_pairs: 80000
+  max_idf_docs: 1500000
 
 blocking:
   same_country_only: true
-  k_faiss: 30
-  k_tfidf: 20
-  k_key: 15
-  k_cap: 40
+  k_faiss: 15
+  k_tfidf: 12
+  k_key: 8
+  k_cap: 20
   tfidf_analyzer: char
   tfidf_ngram_min: 2
   tfidf_ngram_max: 4
-  tfidf_max_features: 200000
+  tfidf_max_features: 80000
   tfidf_min_df: 3
-  tfidf_svd_dim: 256
+  tfidf_svd_dim: 128
   rare_token_idf_quantile: 0.70
   faiss_index: ivf
   faiss_nlist: 4096
-  faiss_nprobe: 32
+  faiss_nprobe: 16
   faiss_use_zero_shot: true
-  faiss_use_finetuned: true
+  faiss_use_finetuned: false
 
 features:
   compute_zero_shot_cosine: true
-  compute_finetuned_cosine: true
-  chunk_pairs: 100000
+  compute_finetuned_cosine: false
+  chunk_pairs: 250000
   n_jobs: -1
 
 matcher:
   objective: binary
   metric: binary_logloss
-  n_estimators: 800
-  learning_rate: 0.05
-  num_leaves: 63
+  n_estimators: 300
+  learning_rate: 0.08
+  num_leaves: 47
   min_child_samples: 50
   subsample: 0.8
   colsample_bytree: 0.8
-  early_stopping_rounds: 50
-  negative_sample_ratio: 8
+  early_stopping_rounds: 30
+  negative_sample_ratio: 4
   n_jobs: -1
   monotone:
     house_num_mismatch: -1
@@ -89,7 +90,7 @@ matcher:
     cosine_combined: 1
 
 biencoder:
-  enabled: true
+  enabled: false
   full_finetune: false
   lora_r: 32
   lora_alpha: 64
@@ -103,11 +104,11 @@ biencoder:
   full_finetune_lr: 2.0e-5
   warmup_ratio: 0.10
   phase_a_epochs: 1
-  phase_b_epochs: 1
+  phase_b_epochs: 0
   hard_negatives_per_anchor: 2
-  max_train_pairs: 200000
-  mine_gallery_size: 400000
-  eval_gallery_size: 50000
+  max_train_pairs: 60000
+  mine_gallery_size: 80000
+  eval_gallery_size: 20000
   max_hard_neg_pool: 80
   use_matryoshka: true
   use_entity_aware_sampler: true
@@ -144,11 +145,11 @@ decision:
   global_threshold: 0.55
   relative_alpha: 0.85
   one_to_one: true
-  compare_all_rules: true
+  compare_all_rules: false
 
 hardware:
-  auto_batch: true
-  encode_batch_size: 64
+  auto_batch: false
+  encode_batch_size: 512
   faiss_gpu: false
 
 debug:

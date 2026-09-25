@@ -258,6 +258,13 @@ def build_all_normalized(cfg) -> dict:
                     continue
                 token_lists.extend(df["core_tokens"].astype(str).map(str.split).tolist())
                 token_lists.extend(df["addr_tokens"].astype(str).map(str.split).tolist())
+            cap = int(getattr(cfg.normalize, "max_idf_docs", 0) or 0)
+            if cap and len(token_lists) > cap:
+                n_docs = len(token_lists)
+                rng = np.random.RandomState(int(cfg.seed))
+                pick = rng.choice(n_docs, size=cap, replace=False)
+                token_lists = [token_lists[i] for i in pick]
+                LOG.info("IDF sampled %s / %s docs (normalize.max_idf_docs)", f"{cap:,}", f"{n_docs:,}")
             idf = compute_idf(token_lists)
             save_idf(idf, idf_path)
             LOG.info("IDF vocab size %s → %s", f"{len(idf):,}", idf_path)

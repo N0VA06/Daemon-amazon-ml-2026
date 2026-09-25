@@ -529,13 +529,17 @@ def train_biencoder(
             history.append(rec_m)
         return history
 
-    hist_a = run_phase(int(cfg.biencoder.phase_a_epochs), remine=False, aux=None, tag="phase_a")
-    hist_b = run_phase(
-        int(cfg.biencoder.phase_b_epochs),
-        remine=True,
-        aux=str(cfg.biencoder.phase_b_aux_loss),
-        tag="phase_b",
-    )
+    hist_a = []
+    if int(cfg.biencoder.phase_a_epochs) > 0:
+        hist_a = run_phase(int(cfg.biencoder.phase_a_epochs), remine=False, aux=None, tag="phase_a")
+    hist_b = []
+    if int(cfg.biencoder.phase_b_epochs) > 0:
+        hist_b = run_phase(
+            int(cfg.biencoder.phase_b_epochs),
+            remine=True,
+            aux=str(cfg.biencoder.phase_b_aux_loss),
+            tag="phase_b",
+        )
     save_lora(st_model, out_dir / "last_adapter")
     merged = merge_lora(st_model, out_dir / "merged")
     metrics = {"phase_a": hist_a, "phase_b": hist_b, "merged": str(merged), "n_pairs": int(len(pairs))}

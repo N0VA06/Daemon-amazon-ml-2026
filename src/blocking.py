@@ -6,6 +6,7 @@ Union, dedupe, cap K per S1. Optionally restrict to the same country string
 
 from __future__ import annotations
 
+import hashlib
 from collections import defaultdict
 from pathlib import Path
 
@@ -30,6 +31,28 @@ def _l2_normalize(x: np.ndarray) -> np.ndarray:
     return (x / n).astype(np.float32)
 
 
+def _emb_fingerprint(mat: np.ndarray) -> str:
+    if mat.size == 0:
+        return "empty"
+    head = np.ascontiguousarray(mat[0, : min(8, mat.shape[1])])
+    tail = np.ascontiguousarray(mat[-1, : min(8, mat.shape[1])])
+    h = hashlib.md5()
+    h.update(str(mat.shape).encode())
+    h.update(head.tobytes())
+    h.update(tail.tobytes())
+    return h.hexdigest()[:12]
+
+
+def _safe_token(s: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(s))[:80]
+
+
+def _faiss_paths(cache_dir: Path, tag: str, country: str, kind: str, nlist: int, xb: np.ndarray) -> tuple[Path, Path]:
+    name = f"{_safe_token(country)}_{kind}_nlist{int(nlist)}_n{xb.shape[0]}_d{xb.shape[1]}_{_emb_fingerprint(xb)}.index"
+    path = Path(cache_dir) / "faiss" / tag / name
+    return path, path.with_name(path.name + ".ids.npy")
+
+
 def _build_faiss(index_kind: str, dim: int, nlist: int, xb: np.ndarray):
     if faiss is None:
         return None
@@ -49,6 +72,32 @@ def _build_faiss(index_kind: str, dim: int, nlist: int, xb: np.ndarray):
     index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT)
     index.train(xb[np.random.choice(n, size=min(n, max(nlist * 40, 256)), replace=False)])
     index.add(xb)
+    return index
+
+
+def _load_or_build_faiss(
+    index_kind: str,
+    nlist: int,
+    xb: np.ndarray,
+    cache_path: Path | None,
+    cache_ids: np.ndarray | None,
+):
+    ids_path = cache_path.with_name(cache_path.name + ".ids.npy") if cache_path is not None else None
+    if cache_path is not None and ids_path is not None and cache_path.exists() and ids_path.exists() and cache_ids is not None:
+        saved = np.load(ids_path, allow_pickle=True)
+        if saved.shape == cache_ids.shape and np.array_equal(saved, cache_ids):
+            try:
+                index = faiss.read_index(str(cache_path))
+                LOG.info("FAISS cache hit  %s  ntotal=%s", cache_path, index.ntotal)
+                return index
+            except Exception as exc:
+                LOG.warning("FAISS cache unreadable (%s); rebuilding", exc)
+    index = _build_faiss(index_kind, xb.shape[1], nlist, xb)
+    if index is not None and cache_path is not None and cache_ids is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        faiss.write_index(index, str(cache_path))
+        np.save(ids_path, cache_ids)
+        LOG.info("FAISS wrote  %s  ntotal=%s", cache_path, index.ntotal)
     return index
 
 
@@ -80,12 +129,14 @@ def search_topk(
     index_kind: str = "ivf",
     nlist: int = 4096,
     nprobe: int = 32,
+    cache_path: Path | None = None,
+    cache_ids: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     xb = np.ascontiguousarray(xb.astype(np.float32))
     xq = np.ascontiguousarray(xq.astype(np.float32))
     if faiss is None:
         return _numpy_topk(xb, xq, k)
-    index = _build_faiss(index_kind, xb.shape[1], nlist, xb)
+    index = _load_or_build_faiss(index_kind, nlist, xb, cache_path, cache_ids)
     if index is None:
         return _numpy_topk(xb, xq, k)
     return _faiss_search(index, xq, k, nprobe)
@@ -110,13 +161,25 @@ def block_faiss_by_country(
     index_kind: str,
     nlist: int,
     nprobe: int,
+    cache_dir: Path | None = None,
+    cache_tag: str | None = None,
 ) -> dict[str, list[tuple[str, float]]]:
     """Return s1_id -> [(gal_id, score), ...] best-first."""
     results: dict[str, list[tuple[str, float]]] = defaultdict(list)
     s1_ids = s1["entity_id"].astype(str).to_numpy()
     gal_ids = gallery["entity_id"].astype(str).to_numpy()
+
+    def _search(xb, xq, kk, country: str, row_ids: np.ndarray):
+        cache_path = None
+        if cache_dir is not None and cache_tag:
+            cache_path, _ = _faiss_paths(cache_dir, cache_tag, country, index_kind, nlist, xb)
+        return search_topk(
+            xb, xq, kk, index_kind, nlist, nprobe,
+            cache_path=cache_path, cache_ids=row_ids,
+        )
+
     if not same_country:
-        scores, idxs = search_topk(gal_emb, s1_emb, k, index_kind, nlist, nprobe)
+        scores, idxs = _search(gal_emb, s1_emb, k, "all", gal_ids)
         for i, s1_id in enumerate(s1_ids):
             for sc, j in zip(scores[i], idxs[i]):
                 if j < 0:
@@ -133,7 +196,7 @@ def block_faiss_by_country(
         xb = gal_emb[gal_pos]
         xq = s1_emb[s1_pos]
         kk = min(k, xb.shape[0])
-        scores, idxs = search_topk(xb, xq, kk, index_kind, nlist, nprobe)
+        scores, idxs = _search(xb, xq, kk, country, gal_ids[gal_pos])
         for row_i, gi in enumerate(s1_pos):
             s1_id = s1_ids[gi]
             for sc, j in zip(scores[row_i], idxs[row_i]):
@@ -155,6 +218,8 @@ def block_tfidf_name(
     index_kind: str,
     nlist: int,
     nprobe: int,
+    cache_dir: Path | None = None,
+    cache_tag: str | None = None,
 ) -> dict[str, list[tuple[str, float]]]:
     texts_s1 = s1["name_exp"].astype(str).tolist()
     texts_g = gallery["name_exp"].astype(str).tolist()
@@ -175,7 +240,8 @@ def block_tfidf_name(
     s1_emb = _l2_normalize(svd.transform(xs).astype(np.float32))
     gal_emb = _l2_normalize(svd.transform(xg).astype(np.float32))
     return block_faiss_by_country(
-        s1, gallery, s1_emb, gal_emb, k, same_country, index_kind, nlist, nprobe
+        s1, gallery, s1_emb, gal_emb, k, same_country, index_kind, nlist, nprobe,
+        cache_dir=cache_dir, cache_tag=cache_tag,
     )
 
 
@@ -268,20 +334,38 @@ def candidates_to_pairs(
     cand_map: dict[str, list[str]],
     score_maps: dict[str, dict[str, list[tuple[str, float]]]] | None = None,
 ) -> pd.DataFrame:
-    rows = []
+    score_lu: dict[str, dict[str, dict[str, float]]] = {}
+    rank_lu: dict[str, dict[str, dict[str, int]]] = {}
+    names = list(score_maps.keys()) if score_maps else []
+    if score_maps:
+        for name, mp in score_maps.items():
+            sm: dict[str, dict[str, float]] = {}
+            rm: dict[str, dict[str, int]] = {}
+            for s1, seq in mp.items():
+                scores = {}
+                ranks = {}
+                for i, (cid, sc) in enumerate(seq):
+                    scores[cid] = sc
+                    ranks[cid] = i
+                sm[s1] = scores
+                rm[s1] = ranks
+            score_lu[name] = sm
+            rank_lu[name] = rm
+
+    s1_col, cand_col, rank_col = [], [], []
+    extra = {f"score_{n}": [] for n in names}
+    extra.update({f"rank_{n}": [] for n in names})
     for s1, cids in cand_map.items():
         for rank, cid in enumerate(cids):
-            rec = {"s1_id": s1, "cand_id": cid, "block_rank": rank}
-            if score_maps:
-                for name, mp in score_maps.items():
-                    lookup = {a: b for a, b in mp.get(s1, [])}
-                    rec[f"score_{name}"] = lookup.get(cid, np.nan)
-                    rec[f"rank_{name}"] = next(
-                        (i for i, (a, _) in enumerate(mp.get(s1, [])) if a == cid),
-                        -1,
-                    )
-            rows.append(rec)
-    return pd.DataFrame(rows)
+            s1_col.append(s1)
+            cand_col.append(cid)
+            rank_col.append(rank)
+            for name in names:
+                extra[f"score_{name}"].append(score_lu[name].get(s1, {}).get(cid, np.nan))
+                extra[f"rank_{name}"].append(rank_lu[name].get(s1, {}).get(cid, -1))
+    data = {"s1_id": s1_col, "cand_id": cand_col, "block_rank": rank_col}
+    data.update(extra)
+    return pd.DataFrame(data)
 
 
 def run_blocking(
@@ -314,6 +398,8 @@ def run_blocking(
             index_kind=str(b.faiss_index),
             nlist=int(b.faiss_nlist),
             nprobe=int(b.faiss_nprobe),
+            cache_dir=Path(cfg.paths.cache_dir),
+            cache_tag=f"{tag}_emb",
         )
         maps.append(faiss_map)
         named["faiss"] = faiss_map
@@ -331,6 +417,8 @@ def run_blocking(
         index_kind=str(b.faiss_index),
         nlist=int(b.faiss_nlist),
         nprobe=int(b.faiss_nprobe),
+        cache_dir=Path(cfg.paths.cache_dir),
+        cache_tag=f"{tag}_tfidf",
     )
     maps.append(tfidf_map)
     named["tfidf"] = tfidf_map

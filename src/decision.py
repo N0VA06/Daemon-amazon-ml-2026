@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
-
 import numpy as np
 import pandas as pd
 
@@ -33,11 +31,12 @@ def greedy_one_to_one(pairs: pd.DataFrame, score_col: str = "p") -> pd.DataFrame
 
 
 def decide_global(pairs: pd.DataFrame, tau: float, score_col: str = "p") -> dict[str, list[str]]:
-    pred: dict[str, list[str]] = defaultdict(list)
-    for row in pairs.itertuples(index=False):
-        if getattr(row, score_col) >= tau:
-            pred[row.s1_id].append(row.cand_id)
-    return dict(pred)
+    if pairs.empty or score_col not in pairs.columns:
+        return {}
+    hit = pairs.loc[pairs[score_col] >= tau, ["s1_id", "cand_id"]]
+    if hit.empty:
+        return {}
+    return hit.groupby("s1_id", sort=False)["cand_id"].apply(list).to_dict()
 
 
 def decide_relative(

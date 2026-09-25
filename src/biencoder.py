@@ -274,7 +274,14 @@ class PairDataset:
         seed: int,
     ):
         self.pairs = pairs.reset_index(drop=True)
-        self.rec = rec
+        self.anchor_ids = self.pairs["anchor_id"].astype(str).tolist()
+        self.positive_ids = self.pairs["positive_id"].astype(str).tolist()
+        self.entity_ids = self.pairs["entity_id"].astype(str).tolist()
+        rec = rec.copy()
+        rec.index = rec.index.astype(str)
+        self.rec_name = rec["name_exp"].astype(str).to_dict()
+        self.rec_addr = rec["address_exp"].astype(str).to_dict()
+        self.rec_country = rec["country_raw"].astype(str).to_dict()
         self.hard = hard
         self.prefix = prefix
         self.template = template
@@ -282,24 +289,22 @@ class PairDataset:
         self.rng = random.Random(seed)
 
     def __len__(self) -> int:
-        return len(self.pairs)
+        return len(self.anchor_ids)
 
     def text_of(self, eid: str, do_aug: bool) -> str:
-        r = self.rec.loc[eid]
-        name, addr = str(r.name_exp), str(r.address_exp)
+        name, addr = self.rec_name[eid], self.rec_addr[eid]
         if do_aug:
             name, addr = augment_record(name, addr, self.rng, p=0.5)
-        return build_record_text(name, addr, str(r.country_raw), self.prefix, self.template)
+        return build_record_text(name, addr, self.rec_country[eid], self.prefix, self.template)
 
     def item(self, i: int) -> dict:
-        row = self.pairs.iloc[i]
-        aug = self.augment
-        negs = self.hard.get(row.anchor_id, [])
+        aid, pid = self.anchor_ids[i], self.positive_ids[i]
+        negs = self.hard.get(aid, [])
         return {
-            "anchor": self.text_of(row.anchor_id, aug),
-            "positive": self.text_of(row.positive_id, aug),
-            "negatives": [self.text_of(n, False) for n in negs if n in self.rec.index],
-            "entity_id": row.entity_id,
+            "anchor": self.text_of(aid, self.augment),
+            "positive": self.text_of(pid, self.augment),
+            "negatives": [self.text_of(n, False) for n in negs if n in self.rec_name],
+            "entity_id": self.entity_ids[i],
             "label": 1,
         }
 

@@ -220,16 +220,16 @@ def _holdout_frames(cfg):
     train_ids = set(splits["holdout_train"])
     val_s1 = s1n[s1n["entity_id"].isin(val_ids)].reset_index(drop=True)
     train_s1 = s1n[s1n["entity_id"].isin(train_ids)].reset_index(drop=True)
+    s2_all, s3_all = s2n, s3n
     g2_p = cache_dir(cfg) / "val_gallery_s2.parquet"
     g3_p = cache_dir(cfg) / "val_gallery_s3.parquet"
     if g2_p.exists():
         g2 = pd.read_parquet(g2_p)
         g3 = pd.read_parquet(g3_p)
-        # attach normalised columns
         s2n = s2n[s2n["entity_id"].isin(set(g2["entity_id"]))].reset_index(drop=True)
         s3n = s3n[s3n["entity_id"].isin(set(g3["entity_id"]))].reset_index(drop=True)
     val_gal = gallery_of(s2n, s3n)
-    return train_s1, val_s1, val_gal, gt, splits, s1n, pd.read_parquet(norm_path(cfg, "train", "s2")), pd.read_parquet(norm_path(cfg, "train", "s3"))
+    return train_s1, val_s1, val_gal, gt, splits, s1n, s2_all, s3_all
 
 
 def _ensure_embeddings(cfg, df, split, source, tag, model=None):
@@ -308,11 +308,13 @@ def stage_train_biencoder(cfg):
     )
 
     out = Path(cfg.paths.models_dir) / "biencoder"
+    eval_n = int(getattr(cfg.biencoder, "eval_gallery_size", 0) or 0)
     metrics = train_biencoder(
         cfg, train_s1, train_gal, train_gt, tmap, None, None, out,
-        val_s1=val_s1, val_gallery=val_gal,
+        val_s1=val_s1 if eval_n > 0 else None,
+        val_gallery=val_gal if eval_n > 0 else None,
     )
-    _log(cfg, "train_biencoder", "Phase A InfoNCE + Phase B remine/CoSENT.", metrics)
+    _log(cfg, "train_biencoder", "LoRA InfoNCE (short fine-tune).", metrics)
     return metrics
 
 

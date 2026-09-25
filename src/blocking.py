@@ -219,12 +219,13 @@ def block_keys(
     for i, s1_id in enumerate(s1_ids):
         hits: dict[str, float] = {}
         for tok in str(s1_core[i]).split():
-            if idf is not None and idf.get(tok, 0.0) < threshold:
+            idf_val = float(idf.get(tok, 0.0)) if idf is not None else 1.0
+            if idf is not None and idf_val < threshold:
                 continue
             for j in token_post.get(tok, ()):
                 if same_country and gal_country[j] != s1_country[i]:
                     continue
-                hits[gal_ids[j]] = hits.get(gal_ids[j], 0.0) + float(idf.get(tok, 1.0) if idf else 1.0)
+                hits[gal_ids[j]] = hits.get(gal_ids[j], 0.0) + idf_val
         if s1_pc[i] and s1_hn[i]:
             for j in key_post.get((s1_pc[i], s1_hn[i]), ()):
                 if same_country and gal_country[j] != s1_country[i]:

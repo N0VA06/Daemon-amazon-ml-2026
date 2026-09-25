@@ -2,9 +2,8 @@
 # Swap the backbone with one key: set backbone.preset to "snowflake"
 # or override backbone.repo / backbone.prefix.
 #
-# 12-hour profile (L4 24 GB + ~124 GB RAM): zs embeddings + LightGBM,
-# no LoRA / CE. Re-run `python -m src.run --stage all` to resume.
-# --status lists what is already done. Logs: reports/logs/.
+# ~12h profile: short LoRA InfoNCE (not full backbone) + LightGBM.
+# Re-run `python -m src.run --stage all` to resume. Logs: reports/logs/.
 
 seed: 42
 team_name: team_jina_er
@@ -62,10 +61,10 @@ normalize:
 
 blocking:
   same_country_only: true      # matches in train share country; France still works
-  k_faiss: 15
-  k_tfidf: 12
-  k_key: 8
-  k_cap: 20                    # 12h: ~35M test pairs instead of 70M+
+  k_faiss: 25
+  k_tfidf: 20
+  k_key: 12
+  k_cap: 40                    # step up from 20; check blocking recall before going to 80
   tfidf_analyzer: char
   tfidf_ngram_min: 2
   tfidf_ngram_max: 4
@@ -77,25 +76,25 @@ blocking:
   faiss_nlist: 4096
   faiss_nprobe: 16
   faiss_use_zero_shot: true    # Stage 3 baseline
-  faiss_use_finetuned: false   # no LoRA in the 12h profile
+  faiss_use_finetuned: false   # val block stays zs; test encode uses merged LoRA
 
 features:
   compute_zero_shot_cosine: true
-  compute_finetuned_cosine: false
+  compute_finetuned_cosine: true
   chunk_pairs: 250000          # 124 GB RAM; smaller is only needed on tight machines
   n_jobs: -1                   # RapidFuzz cpdist workers (-1 = all CPUs)
 
 matcher:
   objective: binary
   metric: binary_logloss
-  n_estimators: 300
+  n_estimators: 800
   learning_rate: 0.08
   num_leaves: 47
   min_child_samples: 50
   subsample: 0.8
   colsample_bytree: 0.8
   early_stopping_rounds: 30
-  negative_sample_ratio: 4
+  negative_sample_ratio: 8
   n_jobs: -1
   # LightGBM monotone: 1 increasing, -1 decreasing
   # applied to named columns below
@@ -108,37 +107,34 @@ matcher:
     cosine_combined: 1
 
 biencoder:
-  enabled: false               # 12h: skip LoRA train + remine + second encode pass
-  full_finetune: false         # ablation only; default is LoRA
-  lora_r: 32
-  lora_alpha: 64
+  enabled: true                # short LoRA fine-tune (not full backbone)
+  full_finetune: false         # MUST stay false — full FT is hours extra
+  lora_r: 16
+  lora_alpha: 32
   lora_dropout: 0.05
   target_modules:
     - q_proj
     - k_proj
     - v_proj
     - o_proj
-    - gate_proj
-    - up_proj
-    - down_proj
   temperature: 0.05            # τ; scale = 1/τ = 20
   scale: 20
   effective_batch_size: 1024
   mini_batch_size: 64
   lr: 1.0e-4                   # 2e-5 if full_finetune
   full_finetune_lr: 2.0e-5
-  warmup_ratio: 0.10
-  phase_a_epochs: 1
-  phase_b_epochs: 0
-  hard_negatives_per_anchor: 2
-  max_train_pairs: 60000
-  mine_gallery_size: 80000
-  eval_gallery_size: 20000
-  max_hard_neg_pool: 80
+  warmup_ratio: 0.06
+  phase_a_epochs: 1            # one InfoNCE pass
+  phase_b_epochs: 0            # skip remine/CoSENT
+  hard_negatives_per_anchor: 1
+  max_train_pairs: 40000       # ~40 GPU steps at batch 1024
+  mine_gallery_size: 40000     # encode this many S2/S3 for hard-neg mine only
+  eval_gallery_size: 0         # 0 = skip mid-train retrieval eval
+  max_hard_neg_pool: 20
   use_matryoshka: true
   use_entity_aware_sampler: true
   no_duplicates: true
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   phase_b_aux_loss: cosent     # cosent | online_contrastive
   online_contrastive_margin: 0.5
   cosent_lambda: 20.0
@@ -170,7 +166,7 @@ decision:
   global_threshold: 0.55
   relative_alpha: 0.85
   one_to_one: true
-  compare_all_rules: false
+  compare_all_rules: true      # hold-out ablation: global / relative / expected_f05
 
 hardware:
   auto_batch: false            # sizes below are used as-is

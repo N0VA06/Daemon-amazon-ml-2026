@@ -218,11 +218,11 @@ def add_rank_context_features(pairs: pd.DataFrame, score_cols: list[str]) -> pd.
     # mutual-best: this S1 is the candidate's best S1 under the first available score
     primary = next((c for c in score_cols if c in df.columns), None)
     if primary is not None:
-        best_s1_for_cand = df.loc[df.groupby("cand_id")[primary].idxmax()]
-        mutual = set(zip(best_s1_for_cand["s1_id"], best_s1_for_cand["cand_id"]))
-        df["mutual_best"] = [
-            int((s1, c) in mutual) for s1, c in zip(df["s1_id"], df["cand_id"])
-        ]
+        best_s1_for_cand = df.loc[df.groupby("cand_id")[primary].idxmax(), ["s1_id", "cand_id"]]
+        best_s1_for_cand = best_s1_for_cand.rename(columns={"s1_id": "_best_s1"})
+        df = df.merge(best_s1_for_cand, on="cand_id", how="left")
+        df["mutual_best"] = (df["s1_id"] == df["_best_s1"]).astype(np.int8)
+        df = df.drop(columns=["_best_s1"])
         # margin of this candidate to its second-best S1
         def _margin(g: pd.DataFrame) -> pd.Series:
             scores = g[primary].to_numpy()
@@ -233,7 +233,7 @@ def add_rank_context_features(pairs: pd.DataFrame, score_cols: list[str]) -> pd.
             return pd.Series(g[primary].to_numpy() - second, index=g.index)
 
         df["cand_margin_second_s1"] = (
-            df.groupby("cand_id", group_keys=False).apply(_margin)
+            df.groupby("cand_id", group_keys=False).apply(_margin, include_groups=False)
         )
     else:
         df["mutual_best"] = 0
@@ -568,10 +568,15 @@ def build_pair_features(
 
 
 def label_pairs(pairs: pd.DataFrame, truth_map: dict[str, set[str]]) -> pd.DataFrame:
-    df = pairs.copy()
-    df["label"] = [
-        int(c in truth_map.get(s1, set())) for s1, c in zip(df["s1_id"], df["cand_id"])
-    ]
+    rows = [(s1, c) for s1, cands in truth_map.items() for c in cands]
+    if not rows:
+        df = pairs.copy()
+        df["label"] = np.int8(0)
+        return df
+    truth = pd.DataFrame(rows, columns=["s1_id", "cand_id"]).drop_duplicates(["s1_id", "cand_id"])
+    truth["label"] = np.int8(1)
+    df = pairs.merge(truth, on=["s1_id", "cand_id"], how="left")
+    df["label"] = df["label"].fillna(0).astype(np.int8)
     return df
 
 

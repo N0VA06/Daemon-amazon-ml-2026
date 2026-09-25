@@ -46,10 +46,10 @@ normalize:
 
 blocking:
   same_country_only: true
-  k_faiss: 15
-  k_tfidf: 12
-  k_key: 8
-  k_cap: 20
+  k_faiss: 25
+  k_tfidf: 20
+  k_key: 12
+  k_cap: 40
   tfidf_analyzer: char
   tfidf_ngram_min: 2
   tfidf_ngram_max: 4
@@ -65,21 +65,21 @@ blocking:
 
 features:
   compute_zero_shot_cosine: true
-  compute_finetuned_cosine: false
+  compute_finetuned_cosine: true
   chunk_pairs: 250000
   n_jobs: -1
 
 matcher:
   objective: binary
   metric: binary_logloss
-  n_estimators: 300
+  n_estimators: 800
   learning_rate: 0.08
   num_leaves: 47
   min_child_samples: 50
   subsample: 0.8
   colsample_bytree: 0.8
   early_stopping_rounds: 30
-  negative_sample_ratio: 4
+  negative_sample_ratio: 8
   n_jobs: -1
   monotone:
     house_num_mismatch: -1
@@ -90,30 +90,30 @@ matcher:
     cosine_combined: 1
 
 biencoder:
-  enabled: false
+  enabled: true
   full_finetune: false
-  lora_r: 32
-  lora_alpha: 64
+  lora_r: 16
+  lora_alpha: 32
   lora_dropout: 0.05
-  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
   temperature: 0.05
   scale: 20
-  effective_batch_size: 512
-  mini_batch_size: 32
+  effective_batch_size: 1024
+  mini_batch_size: 64
   lr: 1.0e-4
   full_finetune_lr: 2.0e-5
-  warmup_ratio: 0.10
+  warmup_ratio: 0.06
   phase_a_epochs: 1
   phase_b_epochs: 0
-  hard_negatives_per_anchor: 2
-  max_train_pairs: 60000
-  mine_gallery_size: 80000
-  eval_gallery_size: 20000
-  max_hard_neg_pool: 80
+  hard_negatives_per_anchor: 1
+  max_train_pairs: 40000
+  mine_gallery_size: 40000
+  eval_gallery_size: 0
+  max_hard_neg_pool: 20
   use_matryoshka: true
   use_entity_aware_sampler: true
   no_duplicates: true
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   phase_b_aux_loss: cosent
   online_contrastive_margin: 0.5
   cosent_lambda: 20.0
@@ -145,7 +145,7 @@ decision:
   global_threshold: 0.55
   relative_alpha: 0.85
   one_to_one: true
-  compare_all_rules: false
+  compare_all_rules: true
 
 hardware:
   auto_batch: false
